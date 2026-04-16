@@ -49,31 +49,6 @@ def velocity_loss_from_dxdydyaw(pred_u: torch.Tensor, gt_u: torch.Tensor, dt: fl
 
     return F.mse_loss(v_pred, v_gt)
 
-def compute_trajectory_error(pred_norm, gt_norm, norm_mean, norm_std, norm_scale):
-    """
-    计算预测轨迹与真实轨迹的平均欧式距离误差（单位：米）。
-    从归一化空间的 dxdydyaw 逆归一化到物理空间，然后积分出轨迹位置，计算位置误差。
-    """
-    # 逆归一化到物理空间
-    pred_phys = (pred_norm * norm_scale * norm_std) + norm_mean
-    gt_phys = (gt_norm * norm_scale * norm_std) + norm_mean
-    
-    # 提取 dx, dy, dyaw
-    dx_pred, dy_pred, _ = pred_phys[..., 0], pred_phys[..., 1], pred_phys[..., 2]
-    dx_gt, dy_gt, _ = gt_phys[..., 0], gt_phys[..., 1], gt_phys[..., 2]
-    
-    # 积分轨迹位置（假设初始位置为0）
-    x_pred = torch.cumsum(dx_pred, dim=1)
-    y_pred = torch.cumsum(dy_pred, dim=1)
-    x_gt = torch.cumsum(dx_gt, dim=1)
-    y_gt = torch.cumsum(dy_gt, dim=1)
-    
-    # 计算每条轨迹的平均欧式距离误差
-    dist_per_traj = torch.sqrt((x_pred - x_gt)**2 + (y_pred - y_gt)**2).mean(dim=1)  # [B]
-    avg_dist = dist_per_traj.mean().item()  # 标量，米
-    return avg_dist
-
-
 def vel_aug(trajs: np.ndarray, dt: float = 0.2, high_speed_threshold_kmh: float = 75.0) -> np.ndarray:
     """
     对轨迹做基于速度的重采样：
@@ -385,7 +360,7 @@ def train_rvq_taae(
         print("Using FP16 mixed precision training")
 
     # 4. 训练循环设置
-    epochs = 300
+    epochs = 2000
 
     # 学习率设置
     initial_lr = 1e-3
@@ -431,13 +406,17 @@ def train_rvq_taae(
           f"std={std.squeeze().cpu().numpy()}, scale={scale_factor.squeeze().cpu().numpy()}")
 
     print("Start Training (Kinematic RVQ Transformer)...")
-
+    # 最大允许误差
+    MAX_LATERAL = 8  # 米
     for epoch in range(epochs):
         model.train()
         total_recon_loss = 0.0
         total_vq_loss = 0.0
         total_kin_smooth_loss = 0.0
         total_traj_error = 0.0
+        total_endpoint_error = 0.0
+        total_vrr_count = 0
+        total_samples = 0
 
         if epoch > epochs * 0.8:
             model.rvq.dropout = 0.0
@@ -489,8 +468,51 @@ def train_rvq_taae(
             
             # 计算轨迹误差
             with torch.no_grad():
-                traj_error = compute_trajectory_error(x_recon, x, model.norm_mean, model.norm_std, model.norm_scale)
+                # 1. 恢复到物理空间
+                pred_phys = (x_recon * model.norm_scale * model.norm_std) + model.norm_mean
+                gt_phys = (x * model.norm_scale * model.norm_std) + model.norm_mean
+                
+                dx_pred, dy_pred, dyaw_pred = pred_phys[..., 0], pred_phys[..., 1], pred_phys[..., 2]
+                dx_gt, dy_gt, dyaw_gt = gt_phys[..., 0], gt_phys[..., 1], gt_phys[..., 2]
+                
+                # 2. 正确的运动学积分 (包含 Yaw 的旋转矩阵)
+                # 累加得到每一步的绝对航向角 (假设初始朝向为 0)
+                yaw_pred = torch.cumsum(dyaw_pred, dim=1)
+                yaw_gt = torch.cumsum(dyaw_gt, dim=1)
+                
+                # 将车身坐标系的 dx, dy 投影到全局 XY 坐标系
+                # 由于第一步是基于当前朝向，我们需要把前一帧的 yaw 作为当前帧的投影基准
+                # 为了简化计算并对齐维度，我们直接用当前 step 的 yaw 做近似投影
+                dx_global_pred = dx_pred * torch.cos(yaw_pred) - dy_pred * torch.sin(yaw_pred)
+                dy_global_pred = dx_pred * torch.sin(yaw_pred) + dy_pred * torch.cos(yaw_pred)
+                
+                dx_global_gt = dx_gt * torch.cos(yaw_gt) - dy_gt * torch.sin(yaw_gt)
+                dy_global_gt = dx_gt * torch.sin(yaw_gt) + dy_gt * torch.cos(yaw_gt)
+                
+                # 全局坐标累加得到真实的 X, Y
+                x_pred_global = torch.cumsum(dx_global_pred, dim=1)
+                y_pred_global = torch.cumsum(dy_global_pred, dim=1)
+                
+                x_gt_global = torch.cumsum(dx_global_gt, dim=1)
+                y_gt_global = torch.cumsum(dy_global_gt, dim=1)
+                
+                # 3. 计算每个时间步的欧式距离误差 [B, T]
+                step_dist_error = torch.sqrt((x_pred_global - x_gt_global)**2 + (y_pred_global - y_gt_global)**2)
+                
+                # 计算 ADE (Average Displacement Error) 和 FDE (Final Displacement Error)
+                traj_error = step_dist_error.mean(dim=1).mean().item() # 平均轨迹误差
+                endpoint_dist = step_dist_error[:, -1].mean().item()   # 第 25 步的误差
+                
+                # 4. 计算真正的 VRR (Valid Reconstruction Rate)
+                # 定义：整条轨迹中最大的位移误差是否小于阈值 MAX_LATERAL
+                max_dist_error_per_traj = step_dist_error.max(dim=1)[0] # [B]
+                valid_count = (max_dist_error_per_traj < MAX_LATERAL).sum().item()
+                
                 total_traj_error += traj_error
+                total_endpoint_error += endpoint_dist
+                total_vrr_count += valid_count
+                total_samples += x.shape[0]
+
         scheduler.step()
 
         if (epoch + 1) % 10 == 0:
@@ -498,6 +520,8 @@ def train_rvq_taae(
             avg_vq = total_vq_loss / len(dataloader)
             avg_kin = total_kin_smooth_loss / len(dataloader)
             avg_traj = total_traj_error / len(dataloader)
+            avg_endpoint = total_endpoint_error / len(dataloader)
+            vrr = total_vrr_count / total_samples if total_samples > 0 else 0.0
             # 打印 v/kappa 的统计信息，方便调试
             with torch.no_grad():
                 v_mean = v.mean().item()
@@ -506,7 +530,7 @@ def train_rvq_taae(
             print(
                 f"[KinRVQ] Epoch {epoch+1:03d} | Recon: {avg_recon:.5f} | "
                 f"VQ: {avg_vq:.5f} | KinSmooth: {avg_kin:.5f} | "
-                f"TrajErr: {avg_traj:.4f} m | "
+                f"TrajErr: {avg_traj:.4f} m | EndErr: {avg_endpoint:.4f} m | VRR: {vrr:.4f} | "
                 f"v_mean: {v_mean:.2f} m/s | v_max: {v_max:.2f} | κ_abs: {kappa_abs_mean:.4f}"
             )
 
