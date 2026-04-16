@@ -10,11 +10,21 @@ import torch.nn.functional as F
 
 def load_sampled_datas():
     # data_path = '/home/zhe.du/code/planner/nio_planner/nn2_tools/work_dirs/pca_tokenizer_dxdydyaw_highway_0122/sample_trajectorys_by_scenario.npy'
-    data_path = '/share-global/zhe.du/planner/planNN2/tokenizer/0124_json/sample_trajectorys_by_scenario_update0210.npy'
+    # data_path = '/share-global/zhe.du/planner/planNN2/tokenizer/0124_json/sample_trajectorys_by_scenario_update0210.npy'
+    data_path = '/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy'
     data = np.load(data_path, allow_pickle=True).item()
     datas = data['trajs']
+    import pdb; pdb.set_trace()
+
     return datas
 
+def load_test_datas():
+    # data_path = '/share-global/zhe.du/planner/planNN2/tokenizer/0124_json/sample_trajectorys_by_scenario_update0210.npy'
+    data_path = '/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy'
+    data = np.load(data_path, allow_pickle=True).item()
+    datas = data['trajs']
+    import pdb; pdb.set_trace()
+    return datas
 
 def preprocess_and_save_norm_params(data_array, save_dir, data_type):
     """
