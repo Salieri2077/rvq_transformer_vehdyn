@@ -282,6 +282,43 @@ class TrajRVQTransformer(nn.Module):
         return x_recon, vq_loss, codes, v, kappa
 
 
+def compute_tcl_loss(codes1: torch.Tensor, codes2: torch.Tensor):
+    """
+    TCL (Temporal Consistency Loss)：约束微小扰动的codes保持相似。
+
+    Args:
+        codes1: 原始轨迹的codes
+        codes2: 扰动轨迹的codes
+
+    Returns:
+        tcl_loss: 标量，codes之间的相似度约束损失
+    """
+    if codes1 is None or codes2 is None:
+        return torch.tensor(0.0, device=codes1.device if codes1 is not None else codes2.device)
+
+    # 保证 inputs 都至少是 2D tensor: [B, num_codes]
+    if codes1.dim() == 1:
+        codes1 = codes1.unsqueeze(0)
+    if codes2.dim() == 1:
+        codes2 = codes2.unsqueeze(0)
+
+    # 对于可能的 RVQ dropout，不同前向传播可能产生不同的 code 数量
+    min_codes = min(codes1.shape[-1], codes2.shape[-1])
+    if min_codes == 0:
+        return torch.tensor(0.0, device=codes1.device)
+
+    codes1_flat = codes1[:, :min_codes].reshape(codes1.shape[0], -1).float()
+    codes2_flat = codes2[:, :min_codes].reshape(codes2.shape[0], -1).float()
+
+    # 取最小 batch size
+    min_batch = min(codes1_flat.shape[0], codes2_flat.shape[0])
+    codes1_flat = codes1_flat[:min_batch]
+    codes2_flat = codes2_flat[:min_batch]
+
+    tcl_loss = F.mse_loss(codes1_flat, codes2_flat)
+    return tcl_loss
+
+
 def train_rvq_taae(
     data_array: np.ndarray,
     save_dir: str = "./work_dirs/tokenizer/rvq_taae_0205",
@@ -291,6 +328,8 @@ def train_rvq_taae(
     """
     使用 TAAE 结构训练 RVQ 模型，整体流程与 train.py 中的 train_rvq 类似，
     方便直接对比效果。
+    
+    加入 TCL (Temporal Consistency Loss) 约束微小扰动的codes保持一致。
 
     Args:
         data_array: [M, T, 3] numpy array (dxdydyaw)
@@ -423,7 +462,7 @@ def train_rvq_taae(
             optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=use_amp, dtype=dtype):
-                x_recon, vq_loss, _, v, kappa = model(x)
+                x_recon, vq_loss, codes, v, kappa = model(x)
 
                 # Loss 1: Reconstruction MSE（归一化空间）
                 mse_dxdy = F.mse_loss(x_recon[..., :2], x[..., :2])
@@ -436,15 +475,30 @@ def train_rvq_taae(
                 kappa_rate = (kappa[:, 1:] - kappa[:, :-1]) / model.dt  # [B, T-1] 曲率变化率
                 kin_smooth_loss = acc.pow(2).mean() + kappa_rate.pow(2).mean()
 
+                # Loss 3: TCL (Temporal Consistency Loss) - 参考 ActionCodec 论文
+                # 对输入加入微小高斯噪声，扰动后的codes应该保持相似
+                tcl_weight = 0.1 if epoch > 30 else 0.0  # 从第30 epoch开始加入TCL
+                if tcl_weight > 0:
+                    noise_scale = 0.02  # 微小高斯噪声的标准差
+                    x_noisy = x + torch.randn_like(x) * noise_scale
+                    # 前向传播扰动后的轨迹，得到codes
+                    _, _, codes_noisy, _, _ = model(x_noisy)
+                    # 计算TCL loss：扰动前后的codes应该相似
+                    tcl_loss = compute_tcl_loss(codes, codes_noisy)
+                else:
+                    tcl_loss = torch.tensor(0.0, device=device)
+
                 # Loss weights
                 recon_loss_weight = 5.0
                 vq_loss_weight = 0.5
                 kin_smooth_weight = 0.1 if epoch > 30 else 0.0
+                tcl_loss_weight = tcl_weight
 
                 loss = (
                     recon_loss_weight * recon_loss
                     + vq_loss_weight * vq_loss
                     + kin_smooth_weight * kin_smooth_loss
+                    + tcl_loss_weight * tcl_loss
                 )
 
             if dtype == torch.float16:
@@ -472,9 +526,15 @@ def train_rvq_taae(
                 v_mean = v.mean().item()
                 v_max = v.max().item()
                 kappa_abs_mean = kappa.abs().mean().item()
+            
+            # 计算TCL loss的统计信息
+            tcl_info = ""
+            if epoch > 30:
+                tcl_info = f" | TCL: {tcl_loss.item():.5f}" if isinstance(tcl_loss, torch.Tensor) and tcl_loss.item() > 0 else ""
+            
             print(
                 f"[KinRVQ] Epoch {epoch+1:03d} | Recon: {avg_recon:.5f} | "
-                f"VQ: {avg_vq:.5f} | KinSmooth: {avg_kin:.5f} | "
+                f"VQ: {avg_vq:.5f} | KinSmooth: {avg_kin:.5f}{tcl_info} | "
                 f"v_mean: {v_mean:.2f} m/s | v_max: {v_max:.2f} | κ_abs: {kappa_abs_mean:.4f}"
             )
 
