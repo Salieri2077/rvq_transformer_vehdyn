@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.tensorboard import SummaryWriter
 
 from rvq_model import ResidualVQ
 from utils import (
@@ -406,8 +407,9 @@ def train_rvq_taae(
           f"std={std.squeeze().cpu().numpy()}, scale={scale_factor.squeeze().cpu().numpy()}")
 
     print("Start Training (Kinematic RVQ Transformer)...")
+    writer = SummaryWriter(log_dir=os.path.join(save_dir, "tensorboard"))
     # 最大允许误差
-    MAX_LATERAL = 8  # 米
+    MAX_LATERAL = 1  # 米
     for epoch in range(epochs):
         model.train()
         total_recon_loss = 0.0
@@ -438,8 +440,11 @@ def train_rvq_taae(
                 # v 的差分 ≈ 加速度，kappa 的差分 ≈ 曲率变化率（方向盘转速）
                 acc = (v[:, 1:] - v[:, :-1]) / model.dt          # [B, T-1] 加速度 (m/s²)
                 kappa_rate = (kappa[:, 1:] - kappa[:, :-1]) / model.dt  # [B, T-1] 曲率变化率
-                kin_smooth_loss = acc.pow(2).mean() + kappa_rate.pow(2).mean()
-
+                # kin_smooth_loss = acc.pow(2).mean() + kappa_rate.pow(2).mean()
+                ### 上述不太对，应该再求一次导数，约束acc和kappa_rate ###
+                acc_rate = (acc[:, 1:] - acc[:, :-1]) / model.dt  # [B, T-2] 加加速度 (m/s³)，即 jerk
+                kappa_acc = (kappa_rate[:, 1:] - kappa_rate[:, :-1]) / model.dt  # [B, T-2] 曲率加速度 (1/m/s²)
+                kin_smooth_loss = acc_rate.pow(2).mean() + kappa_acc.pow(2).mean()
                 # Loss weights
                 recon_loss_weight = 5.0
                 vq_loss_weight = 0.5
@@ -515,10 +520,21 @@ def train_rvq_taae(
 
         scheduler.step()
 
+        # 对应上述weight的tensorborad展示
+        avg_recon = total_recon_loss / len(dataloader)
+        avg_vq = total_vq_loss / len(dataloader)
+        avg_kin = total_kin_smooth_loss / len(dataloader)
+        avg_weight = (
+            5.0 * avg_recon
+            + 0.5 * avg_vq
+            + (0.1 if epoch > 30 else 0.0) * avg_kin
+        )
+        writer.add_scalar("loss/recon", avg_recon, epoch + 1)
+        writer.add_scalar("loss/vq", avg_vq, epoch + 1)
+        writer.add_scalar("loss/kin_smooth", avg_kin, epoch + 1)
+        writer.add_scalar("loss/weight", avg_weight, epoch + 1)
+
         if (epoch + 1) % 10 == 0:
-            avg_recon = total_recon_loss / len(dataloader)
-            avg_vq = total_vq_loss / len(dataloader)
-            avg_kin = total_kin_smooth_loss / len(dataloader)
             avg_traj = total_traj_error / len(dataloader)
             avg_endpoint = total_endpoint_error / len(dataloader)
             vrr = total_vrr_count / total_samples if total_samples > 0 else 0.0
