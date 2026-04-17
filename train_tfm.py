@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 
 from rvq_model import ResidualVQ
 from utils import (
@@ -49,6 +50,32 @@ def velocity_loss_from_dxdydyaw(pred_u: torch.Tensor, gt_u: torch.Tensor, dt: fl
     v_gt = torch.sqrt(dx_gt * dx_gt + dy_gt * dy_gt + eps) / dt
 
     return F.mse_loss(v_pred, v_gt)
+
+
+def acceleration_loss_from_dxdydyaw(pred_u: torch.Tensor, gt_u: torch.Tensor, dt: float = 0.1):
+    """
+    基于 dxdydyaw 计算加速度并施加约束（Batch 版本）。
+
+    思路：
+      - 先由 dx, dy 计算速度标量
+      - 再对速度做一阶差分得到加速度
+    """
+    assert pred_u.shape == gt_u.shape
+    assert pred_u.shape[-1] == 3
+
+    dx_pred = pred_u[:, :, 0]
+    dy_pred = pred_u[:, :, 1]
+    dx_gt = gt_u[:, :, 0]
+    dy_gt = gt_u[:, :, 1]
+
+    eps = 1e-6
+    v_pred = torch.sqrt(dx_pred * dx_pred + dy_pred * dy_pred + eps) / dt
+    v_gt = torch.sqrt(dx_gt * dx_gt + dy_gt * dy_gt + eps) / dt
+
+    a_pred = (v_pred[:, 1:] - v_pred[:, :-1]) / dt
+    a_gt = (v_gt[:, 1:] - v_gt[:, :-1]) / dt
+
+    return F.mse_loss(a_pred, a_gt)
 
 def vel_aug(trajs: np.ndarray, dt: float = 0.2, high_speed_threshold_kmh: float = 75.0) -> np.ndarray:
     """
@@ -407,13 +434,16 @@ def train_rvq_taae(
           f"std={std.squeeze().cpu().numpy()}, scale={scale_factor.squeeze().cpu().numpy()}")
 
     print("Start Training (Kinematic RVQ Transformer)...")
-    writer = SummaryWriter(log_dir=os.path.join(save_dir, "tensorboard"))
+    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    writer = SummaryWriter(log_dir=os.path.join(save_dir, "tensorboard", run_name))
     # 最大允许误差
     MAX_LATERAL = 1  # 米
     for epoch in range(epochs):
         model.train()
         total_recon_loss = 0.0
         total_vq_loss = 0.0
+        total_vel_loss = 0.0
+        total_acc_loss = 0.0
         total_kin_smooth_loss = 0.0
         total_traj_error = 0.0
         total_endpoint_error = 0.0
@@ -436,23 +466,31 @@ def train_rvq_taae(
                 mse_dyaw = F.mse_loss(x_recon[..., 2], x[..., 2])
                 recon_loss = mse_dxdy + 14.0 * mse_dyaw
 
-                # Loss 2: 运动学参数平滑性（直接约束物理量，比频域 smoothness 更直观）
+                # Loss 2: 真实动态监督
+                vel_loss = velocity_loss_from_dxdydyaw(x_recon, x, dt=model.dt)
+                acc_loss = acceleration_loss_from_dxdydyaw(x_recon, x, dt=model.dt)
+
+                # Loss 3: 运动学参数平滑性（直接约束物理量，比频域 smoothness 更直观）
                 # v 的差分 ≈ 加速度，kappa 的差分 ≈ 曲率变化率（方向盘转速）
                 acc = (v[:, 1:] - v[:, :-1]) / model.dt          # [B, T-1] 加速度 (m/s²)
                 kappa_rate = (kappa[:, 1:] - kappa[:, :-1]) / model.dt  # [B, T-1] 曲率变化率
-                # kin_smooth_loss = acc.pow(2).mean() + kappa_rate.pow(2).mean()
+                kin_smooth_loss = acc.pow(2).mean() + kappa_rate.pow(2).mean()
                 ### 上述不太对，应该再求一次导数，约束acc和kappa_rate ###
                 acc_rate = (acc[:, 1:] - acc[:, :-1]) / model.dt  # [B, T-2] 加加速度 (m/s³)，即 jerk
                 kappa_acc = (kappa_rate[:, 1:] - kappa_rate[:, :-1]) / model.dt  # [B, T-2] 曲率加速度 (1/m/s²)
-                kin_smooth_loss = acc_rate.pow(2).mean() + kappa_acc.pow(2).mean()
+                # kin_smooth_loss = acc_rate.pow(2).mean() + kappa_acc.pow(2).mean()
                 # Loss weights
                 recon_loss_weight = 5.0
                 vq_loss_weight = 0.5
-                kin_smooth_weight = 0.1 if epoch > 30 else 0.0
+                vel_loss_weight = 1.0
+                acc_loss_weight = 0.5
+                kin_smooth_weight = 1e-3 if epoch > 30 else 0.0
 
                 loss = (
                     recon_loss_weight * recon_loss
                     + vq_loss_weight * vq_loss
+                    + vel_loss_weight * vel_loss
+                    + acc_loss_weight * acc_loss
                     + kin_smooth_weight * kin_smooth_loss
                 )
 
@@ -469,6 +507,8 @@ def train_rvq_taae(
 
             total_recon_loss += recon_loss.item()
             total_vq_loss += vq_loss.item()
+            total_vel_loss += vel_loss.item()
+            total_acc_loss += acc_loss.item()
             total_kin_smooth_loss += kin_smooth_loss.item()
             
             # 计算轨迹误差
@@ -523,14 +563,20 @@ def train_rvq_taae(
         # 对应上述weight的tensorborad展示
         avg_recon = total_recon_loss / len(dataloader)
         avg_vq = total_vq_loss / len(dataloader)
+        avg_vel = total_vel_loss / len(dataloader)
+        avg_acc = total_acc_loss / len(dataloader)
         avg_kin = total_kin_smooth_loss / len(dataloader)
         avg_weight = (
             5.0 * avg_recon
             + 0.5 * avg_vq
-            + (0.1 if epoch > 30 else 0.0) * avg_kin
+            + 1.0 * avg_vel
+            + 0.5 * avg_acc
+            + (1e-3 if epoch > 30 else 0.0) * avg_kin
         )
         writer.add_scalar("loss/recon", avg_recon, epoch + 1)
         writer.add_scalar("loss/vq", avg_vq, epoch + 1)
+        writer.add_scalar("loss/vel", avg_vel, epoch + 1)
+        writer.add_scalar("loss/acc", avg_acc, epoch + 1)
         writer.add_scalar("loss/kin_smooth", avg_kin, epoch + 1)
         writer.add_scalar("loss/weight", avg_weight, epoch + 1)
 
@@ -545,7 +591,7 @@ def train_rvq_taae(
                 kappa_abs_mean = kappa.abs().mean().item()
             print(
                 f"[KinRVQ] Epoch {epoch+1:03d} | Recon: {avg_recon:.5f} | "
-                f"VQ: {avg_vq:.5f} | KinSmooth: {avg_kin:.5f} | "
+                f"VQ: {avg_vq:.5f} | Vel: {avg_vel:.5f} | Acc: {avg_acc:.5f} | KinSmooth: {avg_kin:.5f} | "
                 f"TrajErr: {avg_traj:.4f} m | EndErr: {avg_endpoint:.4f} m | VRR: {vrr:.4f} | "
                 f"v_mean: {v_mean:.2f} m/s | v_max: {v_max:.2f} | κ_abs: {kappa_abs_mean:.4f}"
             )
@@ -556,6 +602,7 @@ def train_rvq_taae(
         os.path.join(save_dir, f"{data_type}_rvq_taae_model.pth"),
     )
     print(f"TAAE Training Done. Model saved to {save_dir}")
+    writer.close()
 
 
 if __name__ == "__main__":
