@@ -14,8 +14,6 @@ def load_sampled_datas():
     data_path = '/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy'
     data = np.load(data_path, allow_pickle=True).item()
     datas = data['trajs']
-    import pdb; pdb.set_trace()
-
     return datas
 
 def load_test_datas():
@@ -23,7 +21,6 @@ def load_test_datas():
     data_path = '/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy'
     data = np.load(data_path, allow_pickle=True).item()
     datas = data['trajs']
-    import pdb; pdb.set_trace()
     return datas
 
 def preprocess_and_save_norm_params(data_array, save_dir, data_type):

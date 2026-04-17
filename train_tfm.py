@@ -360,7 +360,7 @@ def train_rvq_taae(
         print("Using FP16 mixed precision training")
 
     # 4. 训练循环设置
-    epochs = 2000
+    epochs = 250
 
     # 学习率设置
     initial_lr = 1e-3
