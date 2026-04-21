@@ -15,7 +15,8 @@ def evaluate_tokenizer_health(
     dataloader: DataLoader,
     device: torch.device,
     noise_std_xy: float = 0.05,  # 给物理空间的 dx, dy 加入 5cm 的扰动
-    noise_std_yaw: float = 0.0  # 给物理空间的 dyaw 加入 0.01 弧度的扰动
+    noise_std_yaw: float = 0.01,  # 给物理空间的 dyaw 加入 0.01 弧度的扰动
+    clip_limit: torch.Tensor = None,
 ):
     """
     评估 Tokenizer 的健康度与拓扑稳定性。
@@ -30,6 +31,7 @@ def evaluate_tokenizer_health(
     
     # 记录每个 RVQ 层激活的 Token 集合
     active_tokens_per_layer = [set() for _ in range(num_layers)]
+    token_counts_per_layer = torch.zeros(num_layers, vocab_size, dtype=torch.long)
     
     # 记录 Overlap Rate 的统计变量
     total_samples = 0
@@ -54,6 +56,8 @@ def evaluate_tokenizer_health(
             codes_cpu = codes_clean.cpu().numpy()
             for i in range(num_layers):
                 active_tokens_per_layer[i].update(codes_cpu[:, i].tolist())
+                layer_counts = torch.bincount(codes_clean[:, i].cpu(), minlength=vocab_size)
+                token_counts_per_layer[i] += layer_counts
 
             # ==========================================
             # 2. 注入物理微小噪声
@@ -71,7 +75,11 @@ def evaluate_tokenizer_health(
             x_phys_noisy = x_phys + noise
             
             # 物理空间 -> 归一化空间
-            x_norm_noisy = (x_phys_noisy - model.norm_mean) / (model.norm_std + 1e-8) / model.norm_scale
+            # 保持和训练时一致：z-score -> clip -> scale。
+            x_z_noisy = (x_phys_noisy - model.norm_mean) / (model.norm_std + 1e-8)
+            if clip_limit is not None:
+                x_z_noisy = torch.clamp(x_z_noisy, -clip_limit, clip_limit)
+            x_norm_noisy = x_z_noisy / model.norm_scale
 
             # ==========================================
             # 3. 噪声推理：获取加噪后的 Token
@@ -113,6 +121,31 @@ def evaluate_tokenizer_health(
     print(f"平均字典利用率: {avg_utilization / num_layers:.2f}%")
     if avg_utilization / num_layers < 20:
         print("警告: 字典严重坍缩 (Dead Codes)！大模型将面临词汇量贫乏的问题。")
+
+    # 1.5 输出字典使用分布，避免“用过很多 code，但少数 code 占比极高”的情况被掩盖
+    print("\n[1.5] 字典使用分布 (Code Usage Distribution):")
+    for i in range(num_layers):
+        counts = token_counts_per_layer[i].float()
+        probs = counts / counts.sum().clamp_min(1.0)
+        sorted_probs, sorted_ids = torch.sort(probs, descending=True)
+        top1_rate = sorted_probs[0].item() * 100
+        top5_rate = sorted_probs[:5].sum().item() * 100
+        entropy = -(probs[probs > 0] * torch.log(probs[probs > 0])).sum()
+        perplexity = torch.exp(entropy).item()
+
+        if i < 4 or i == num_layers - 1:
+            top_ids = sorted_ids[:5].tolist()
+            top_rates = [round(v * 100, 2) for v in sorted_probs[:5].tolist()]
+            print(
+                f"  - 第 {i+1:02d} 层: top1={top1_rate:5.2f}% | "
+                f"top5={top5_rate:5.2f}% | perplexity={perplexity:7.2f} | "
+                f"top_ids={top_ids} | top_rates={top_rates}%"
+            )
+        elif i == 4:
+            print("  - ...")
+
+        if top1_rate > 50:
+            print(f"    警告: 第 {i+1:02d} 层单个 token 占比超过 50%，可能存在使用分布过度集中。")
 
     # 2. 输出拓扑稳定性 (Overlap Rate)
     print("\n[2] 拓扑稳定性 / 噪声抗性 (Overlap Rate - OR):")
@@ -161,9 +194,13 @@ if __name__ == "__main__":
     mean = torch.tensor(norm_params['mean'], dtype=torch.float32).to(device)
     std = torch.tensor(norm_params['std'], dtype=torch.float32).to(device)
     scale = torch.tensor(norm_params['scale_factor'], dtype=torch.float32).to(device)
+    clip_limit = torch.tensor(norm_params['clip_limit'], dtype=torch.float32).to(device) if 'clip_limit' in norm_params else None
     
-    # 数据归一化 (一定要和训练时的一致！)
-    test_norm = (torch.tensor(test_trajs, dtype=torch.float32).to(device) - mean) / (std + 1e-8) / scale
+    # 数据归一化和训练时保持一致：z-score -> clip -> scale。
+    test_norm = (torch.tensor(test_trajs, dtype=torch.float32).to(device) - mean) / (std + 1e-8)
+    if clip_limit is not None:
+        test_norm = torch.clamp(test_norm, -clip_limit, clip_limit)
+    test_norm = test_norm / scale
     
     dataset = TensorDataset(test_norm)
     dataloader = DataLoader(dataset, batch_size=4096, shuffle=False)
@@ -183,4 +220,4 @@ if __name__ == "__main__":
     model.set_norm_params(mean, std, scale)
     model.load_state_dict(torch.load(model_path, map_location=device))
     
-    evaluate_tokenizer_health(model, dataloader, device)
+    evaluate_tokenizer_health(model, dataloader, device, clip_limit=clip_limit)

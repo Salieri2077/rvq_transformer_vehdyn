@@ -77,6 +77,47 @@ def acceleration_loss_from_dxdydyaw(pred_u: torch.Tensor, gt_u: torch.Tensor, dt
 
     return F.mse_loss(a_pred, a_gt)
 
+
+def integrate_to_global_torch(trajs: torch.Tensor) -> torch.Tensor:
+    dx = trajs[:, :, 0]
+    dy = trajs[:, :, 1]
+    dyaw = trajs[:, :, 2]
+    yaw = torch.cumsum(dyaw, dim=1)
+    prev_yaw = torch.zeros_like(yaw)
+    prev_yaw[:, 1:] = yaw[:, :-1]
+
+    dx_global = dx * torch.cos(prev_yaw) - dy * torch.sin(prev_yaw)
+    dy_global = dx * torch.sin(prev_yaw) + dy * torch.cos(prev_yaw)
+
+    x_global = torch.cumsum(dx_global, dim=1)
+    y_global = torch.cumsum(dy_global, dim=1)
+    return torch.stack([x_global, y_global], dim=-1)
+
+
+def turn_global_yaw_loss(
+    pred_phys: torch.Tensor,
+    gt_phys: torch.Tensor,
+    turn_threshold: float = 0.35,
+):
+    net_yaw = torch.sum(gt_phys[:, :, 2], dim=1)
+    turn_mask = torch.abs(net_yaw) > turn_threshold
+    if not torch.any(turn_mask):
+        zero = pred_phys.sum() * 0.0
+        return zero, zero, turn_mask
+
+    pred_turn = pred_phys[turn_mask]
+    gt_turn = gt_phys[turn_mask]
+
+    pred_xy = integrate_to_global_torch(pred_turn)
+    gt_xy = integrate_to_global_torch(gt_turn)
+    global_xy_loss = F.mse_loss(pred_xy, gt_xy)
+
+    pred_yaw = torch.cumsum(pred_turn[:, :, 2], dim=1)
+    gt_yaw = torch.cumsum(gt_turn[:, :, 2], dim=1)
+    cumulative_yaw_loss = F.mse_loss(pred_yaw, gt_yaw)
+    return global_xy_loss, cumulative_yaw_loss, turn_mask
+
+
 def vel_aug(trajs: np.ndarray, dt: float = 0.2, high_speed_threshold_kmh: float = 75.0) -> np.ndarray:
     """
     对轨迹做基于速度的重采样：
@@ -445,6 +486,9 @@ def train_rvq_taae(
         total_vel_loss = 0.0
         total_acc_loss = 0.0
         total_kin_smooth_loss = 0.0
+        total_turn_global_loss = 0.0
+        total_turn_yaw_loss = 0.0
+        total_turn_samples = 0
         total_traj_error = 0.0
         total_endpoint_error = 0.0
         total_vrr_count = 0
@@ -470,6 +514,14 @@ def train_rvq_taae(
                 vel_loss = velocity_loss_from_dxdydyaw(x_recon, x, dt=model.dt)
                 acc_loss = acceleration_loss_from_dxdydyaw(x_recon, x, dt=model.dt)
 
+                pred_phys_for_loss = (x_recon * model.norm_scale * model.norm_std) + model.norm_mean
+                gt_phys_for_loss = (x * model.norm_scale * model.norm_std) + model.norm_mean
+                turn_global_loss, turn_yaw_loss, turn_mask = turn_global_yaw_loss(
+                    pred_phys_for_loss,
+                    gt_phys_for_loss,
+                    turn_threshold=0.35,
+                )
+
                 # Loss 3: 运动学参数平滑性（直接约束物理量，比频域 smoothness 更直观）
                 # v 的差分 ≈ 加速度，kappa 的差分 ≈ 曲率变化率（方向盘转速）
                 acc = (v[:, 1:] - v[:, :-1]) / model.dt          # [B, T-1] 加速度 (m/s²)
@@ -485,6 +537,8 @@ def train_rvq_taae(
                 vel_loss_weight = 0.0
                 acc_loss_weight = 0.0
                 kin_smooth_weight = 1e-2 if epoch > 30 else 0.0
+                turn_global_weight = 1.0
+                turn_yaw_weight = 2.0
 
                 loss = (
                     recon_loss_weight * recon_loss
@@ -492,6 +546,8 @@ def train_rvq_taae(
                     + vel_loss_weight * vel_loss
                     + acc_loss_weight * acc_loss
                     + kin_smooth_weight * kin_smooth_loss
+                    + turn_global_weight * turn_global_loss
+                    + turn_yaw_weight * turn_yaw_loss
                 )
 
             if dtype == torch.float16:
@@ -510,6 +566,9 @@ def train_rvq_taae(
             total_vel_loss += vel_loss.item()
             total_acc_loss += acc_loss.item()
             total_kin_smooth_loss += kin_smooth_loss.item()
+            total_turn_global_loss += turn_global_loss.item()
+            total_turn_yaw_loss += turn_yaw_loss.item()
+            total_turn_samples += turn_mask.sum().item()
             
             # 计算轨迹误差
             with torch.no_grad():
@@ -566,18 +625,25 @@ def train_rvq_taae(
         avg_vel = total_vel_loss / len(dataloader)
         avg_acc = total_acc_loss / len(dataloader)
         avg_kin = total_kin_smooth_loss / len(dataloader)
+        avg_turn_global = total_turn_global_loss / len(dataloader)
+        avg_turn_yaw = total_turn_yaw_loss / len(dataloader)
+        turn_ratio = total_turn_samples / total_samples if total_samples > 0 else 0.0
         avg_weight = (
             10.0 * avg_recon
             + 5.0 * avg_vq
             + 0.0 * avg_vel
             + 0.0 * avg_acc
             + (1e-2 if epoch > 30 else 0.0) * avg_kin
+            + 1.0 * avg_turn_global
+            + 2.0 * avg_turn_yaw
         )
         writer.add_scalar("loss/weight_recon", 10.0 * avg_recon, epoch + 1)
         writer.add_scalar("loss/weight_vq", 5.0 * avg_vq, epoch + 1)
         writer.add_scalar("loss/weight_vel", 0.0 * avg_vel, epoch + 1)
         writer.add_scalar("loss/weight_acc", 0.0 * avg_acc, epoch + 1)
         writer.add_scalar("loss/weight_kin_smooth", (1e-2 if epoch > 30 else 0.0) * avg_kin, epoch + 1)
+        writer.add_scalar("loss/weight_turn_global", 1.0 * avg_turn_global, epoch + 1)
+        writer.add_scalar("loss/weight_turn_yaw", 2.0 * avg_turn_yaw, epoch + 1)
         writer.add_scalar("loss/weight", avg_weight, epoch + 1)
 
         if (epoch + 1) % 10 == 0:
@@ -592,6 +658,7 @@ def train_rvq_taae(
             print(
                 f"[KinRVQ] Epoch {epoch+1:03d} | Recon: {avg_recon:.5f} | "
                 f"VQ: {avg_vq:.5f} | Vel: {avg_vel:.5f} | Acc: {avg_acc:.5f} | KinSmooth: {avg_kin:.5f} | "
+                f"TurnGlobal: {avg_turn_global:.5f} | TurnYaw: {avg_turn_yaw:.5f} | TurnRatio: {turn_ratio:.3f} | "
                 f"TrajErr: {avg_traj:.4f} m | EndErr: {avg_endpoint:.4f} m | VRR: {vrr:.4f} | "
                 f"v_mean: {v_mean:.2f} m/s | v_max: {v_max:.2f} | κ_abs: {kappa_abs_mean:.4f}"
             )
