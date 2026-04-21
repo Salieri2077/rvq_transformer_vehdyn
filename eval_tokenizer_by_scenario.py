@@ -187,6 +187,60 @@ def select_representative_indices(categories: Dict[str, np.ndarray], feat: Dict[
     return out
 
 
+def select_velocity_acc_variation_indices(
+    trajs: np.ndarray,
+    categories: Dict[str, np.ndarray],
+    dt: float,
+    num_samples: int,
+    exclude_indices: Dict[str, Dict],
+) -> Dict[str, List[Dict]]:
+    speed, acc = compute_speed_and_acc(trajs, dt)
+    speed_std = np.std(speed, axis=1)
+    if acc.shape[1] > 0:
+        acc_std = np.std(acc, axis=1)
+        acc_abs_mean = np.mean(np.abs(acc), axis=1)
+    else:
+        acc_std = np.zeros(len(trajs), dtype=np.float32)
+        acc_abs_mean = np.zeros(len(trajs), dtype=np.float32)
+
+    out = {}
+    for scenario_name, mask in categories.items():
+        idxs = np.where(mask)[0]
+        if len(idxs) == 0 or num_samples <= 0:
+            out[scenario_name] = []
+            continue
+
+        classic_idx = exclude_indices.get(scenario_name, {}).get("idx")
+        if classic_idx is not None:
+            idxs = idxs[idxs != classic_idx]
+        if len(idxs) == 0:
+            out[scenario_name] = []
+            continue
+
+        scenario_speed_std = speed_std[idxs]
+        scenario_acc_std = acc_std[idxs]
+        scenario_acc_abs_mean = acc_abs_mean[idxs]
+        score = (
+            scenario_speed_std / (scenario_speed_std.max() + 1e-6)
+            + scenario_acc_std / (scenario_acc_std.max() + 1e-6)
+            + scenario_acc_abs_mean / (scenario_acc_abs_mean.max() + 1e-6)
+        )
+
+        order = np.argsort(-score)[:num_samples]
+        out[scenario_name] = [
+            {
+                "idx": int(idxs[i]),
+                "info": {
+                    "speed_std_mps": float(speed_std[idxs[i]]),
+                    "acc_std_mps2": float(acc_std[idxs[i]]),
+                    "acc_abs_mean_mps2": float(acc_abs_mean[idxs[i]]),
+                },
+            }
+            for i in order
+        ]
+    return out
+
+
 def integrate_to_global(trajs: np.ndarray) -> np.ndarray:
     dx = trajs[:, :, 0]
     dy = trajs[:, :, 1]
@@ -355,6 +409,7 @@ def main():
     parser.add_argument("--fps", type=float, default=5.0)
     parser.add_argument("--dt", type=float, default=0.2)
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--num-var-plots", type=int, default=3)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -383,6 +438,13 @@ def main():
 
     categories, feat = build_scenario_masks(trajs, fps=args.fps)
     representatives = select_representative_indices(categories, feat)
+    variation_representatives = select_velocity_acc_variation_indices(
+        trajs=trajs,
+        categories=categories,
+        dt=args.dt,
+        num_samples=args.num_var_plots,
+        exclude_indices=representatives,
+    )
 
     metrics_by_scenario = {}
     for scenario_name, mask in categories.items():
@@ -409,8 +471,18 @@ def main():
             gt_traj=trajs[rep_idx],
             pred_traj=recon_trajs[rep_idx],
             dt=args.dt,
-            save_path=os.path.join(output_dir, f"{scenario_name}.png"),
+            save_path=os.path.join(output_dir, f"{scenario_name}_classic.png"),
         )
+        for plot_id, item in enumerate(variation_representatives[scenario_name], start=1):
+            var_idx = item["idx"]
+            plot_representative_case(
+                scenario_name=f"{scenario_name} Var{plot_id}",
+                sample_idx=var_idx,
+                gt_traj=trajs[var_idx],
+                pred_traj=recon_trajs[var_idx],
+                dt=args.dt,
+                save_path=os.path.join(output_dir, f"{scenario_name}_var{plot_id:02d}.png"),
+            )
 
     overall_metrics = scenario_metrics(trajs, recon_trajs, dt=args.dt)
     summary = {
@@ -422,10 +494,12 @@ def main():
             "fps": args.fps,
             "dt": args.dt,
             "output_dir": output_dir,
+            "num_var_plots": args.num_var_plots,
         },
         "overall": overall_metrics,
         "scenarios": metrics_by_scenario,
         "representatives": representatives,
+        "variation_representatives": variation_representatives,
         "token_shape": list(codes.shape),
     }
 
@@ -454,8 +528,9 @@ def main():
 if __name__ == "__main__":
     main()
 
-# python rvq_transformer_vehdyn/eval_tokenizer_by_scenario.py \
+# python eval_tokenizer_by_scenario.py \
 #   --data-path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy \
 #   --save-dir ./work_dirs/tokenizer/rvq_tfm_kin_0311 \
-#   --data-type pred
+#   --data-type pred \
+#   --num-var-plots 5
 

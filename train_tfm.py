@@ -476,15 +476,15 @@ def train_rvq_taae(
                 kappa_rate = (kappa[:, 1:] - kappa[:, :-1]) / model.dt  # [B, T-1] 曲率变化率
                 kin_smooth_loss = acc.pow(2).mean() + kappa_rate.pow(2).mean()
                 ### 上述不太对，应该再求一次导数，约束acc和kappa_rate ###
-                acc_rate = (acc[:, 1:] - acc[:, :-1]) / model.dt  # [B, T-2] 加加速度 (m/s³)，即 jerk
-                kappa_acc = (kappa_rate[:, 1:] - kappa_rate[:, :-1]) / model.dt  # [B, T-2] 曲率加速度 (1/m/s²)
+                # acc_rate = (acc[:, 1:] - acc[:, :-1]) / model.dt  # [B, T-2] 加加速度 (m/s³)，即 jerk
+                # kappa_acc = (kappa_rate[:, 1:] - kappa_rate[:, :-1]) / model.dt  # [B, T-2] 曲率加速度 (1/m/s²)
                 # kin_smooth_loss = acc_rate.pow(2).mean() + kappa_acc.pow(2).mean()
                 # Loss weights
-                recon_loss_weight = 5.0
-                vq_loss_weight = 0.5
-                vel_loss_weight = 1.0
-                acc_loss_weight = 0.5
-                kin_smooth_weight = 1e-3 if epoch > 30 else 0.0
+                recon_loss_weight = 10.0
+                vq_loss_weight = 5.0
+                vel_loss_weight = 0.0
+                acc_loss_weight = 0.0
+                kin_smooth_weight = 1e-2 if epoch > 30 else 0.0
 
                 loss = (
                     recon_loss_weight * recon_loss
@@ -567,17 +567,17 @@ def train_rvq_taae(
         avg_acc = total_acc_loss / len(dataloader)
         avg_kin = total_kin_smooth_loss / len(dataloader)
         avg_weight = (
-            5.0 * avg_recon
-            + 0.5 * avg_vq
-            + 1.0 * avg_vel
-            + 0.5 * avg_acc
-            + (1e-3 if epoch > 30 else 0.0) * avg_kin
+            10.0 * avg_recon
+            + 5.0 * avg_vq
+            + 0.0 * avg_vel
+            + 0.0 * avg_acc
+            + (1e-2 if epoch > 30 else 0.0) * avg_kin
         )
-        writer.add_scalar("loss/recon", avg_recon, epoch + 1)
-        writer.add_scalar("loss/vq", avg_vq, epoch + 1)
-        writer.add_scalar("loss/vel", avg_vel, epoch + 1)
-        writer.add_scalar("loss/acc", avg_acc, epoch + 1)
-        writer.add_scalar("loss/kin_smooth", avg_kin, epoch + 1)
+        writer.add_scalar("loss/weight_recon", 10.0 * avg_recon, epoch + 1)
+        writer.add_scalar("loss/weight_vq", 5.0 * avg_vq, epoch + 1)
+        writer.add_scalar("loss/weight_vel", 0.0 * avg_vel, epoch + 1)
+        writer.add_scalar("loss/weight_acc", 0.0 * avg_acc, epoch + 1)
+        writer.add_scalar("loss/weight_kin_smooth", (1e-2 if epoch > 30 else 0.0) * avg_kin, epoch + 1)
         writer.add_scalar("loss/weight", avg_weight, epoch + 1)
 
         if (epoch + 1) % 10 == 0:
