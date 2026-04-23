@@ -3,13 +3,14 @@ import csv
 import json
 import os
 import pickle
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
 from train_tfm import TrajRVQTransformer
+from train_tfm_accint import AccBoundaryRVQTokenizer
 
 
 def load_trajs(data_path: str) -> np.ndarray:
@@ -263,8 +264,11 @@ def compute_speed_and_acc(trajs: np.ndarray, dt: float) -> Tuple[np.ndarray, np.
     return speed, acc
 
 
+ModelUnion = Union[TrajRVQTransformer, AccBoundaryRVQTokenizer]
+
+
 def reconstruct_trajs(
-    model: TrajRVQTransformer,
+    model: ModelUnion,
     trajs: np.ndarray,
     mean: torch.Tensor,
     std: torch.Tensor,
@@ -402,16 +406,37 @@ def plot_representative_case(
     plt.close(fig)
 
 
-def build_model(model_path: str, input_steps: int, device: torch.device) -> TrajRVQTransformer:
-    model = TrajRVQTransformer(
-        input_steps=input_steps,
-        input_dim=3,
-        num_layers=15,
-        vocab_size=1024,
-        d_model=128,
-        nhead=4,
-        num_transformer_layers=2,
-    ).to(device)
+def infer_model_type(model_path: str, model_type: str) -> str:
+    if model_type != "auto":
+        return model_type
+    basename = os.path.basename(model_path)
+    if "accint" in basename:
+        return "accint"
+    return "taae"
+
+
+def build_model(model_path: str, input_steps: int, device: torch.device, model_type: str) -> ModelUnion:
+    if model_type == "accint":
+        model = AccBoundaryRVQTokenizer(
+            input_steps=input_steps,
+            input_dim=3,
+            num_layers=15,
+            vocab_size=1024,
+            d_model=128,
+            nhead=4,
+            num_transformer_layers=2,
+            dt=0.2,
+        ).to(device)
+    else:
+        model = TrajRVQTransformer(
+            input_steps=input_steps,
+            input_dim=3,
+            num_layers=15,
+            vocab_size=1024,
+            d_model=128,
+            nhead=4,
+            num_transformer_layers=2,
+        ).to(device)
     state_dict = torch.load(model_path, map_location=device)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
@@ -439,6 +464,8 @@ def main():
     parser = argparse.ArgumentParser(description="Scenario-wise tokenizer evaluation for kinematic RVQ transformer.")
     parser.add_argument("--data-path", type=str, default="/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy")
     parser.add_argument("--save-dir", type=str, default="./work_dirs/tokenizer/rvq_tfm_kin_0311")
+    parser.add_argument("--model-path", type=str, default=None)
+    parser.add_argument("--model-type", type=str, default="auto", choices=["auto", "taae", "accint"])
     parser.add_argument("--data-type", type=str, default="pred", choices=["pred", "history"])
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--fps", type=float, default=5.0)
@@ -449,7 +476,18 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_path = os.path.join(args.save_dir, f"{args.data_type}_rvq_taae_model.pth")
+    if args.model_path is not None:
+        model_path = args.model_path
+    elif args.model_type == "accint":
+        model_path = os.path.join(args.save_dir, f"{args.data_type}_rvq_accint_model.pth")
+    elif args.model_type == "taae":
+        model_path = os.path.join(args.save_dir, f"{args.data_type}_rvq_taae_model.pth")
+    else:
+        accint_path = os.path.join(args.save_dir, f"{args.data_type}_rvq_accint_model.pth")
+        taae_path = os.path.join(args.save_dir, f"{args.data_type}_rvq_taae_model.pth")
+        model_path = accint_path if os.path.exists(accint_path) else taae_path
+
+    resolved_model_type = infer_model_type(model_path, args.model_type)
     norm_path = os.path.join(args.save_dir, f"{args.data_type}_norm_params.pkl")
     output_dir = args.output_dir or os.path.join(args.save_dir, "scenario_eval")
     os.makedirs(output_dir, exist_ok=True)
@@ -458,7 +496,7 @@ def main():
     if args.data_type == "history":
         trajs = trajs[:, :14, :]
 
-    model = build_model(model_path, input_steps=trajs.shape[1], device=device)
+    model = build_model(model_path, input_steps=trajs.shape[1], device=device, model_type=resolved_model_type)
     norm_params = load_norm_params(norm_path, device)
     model.set_norm_params(norm_params["mean"], norm_params["std"], norm_params["scale_factor"])
 
@@ -541,6 +579,8 @@ def main():
         "config": {
             "data_path": args.data_path,
             "save_dir": args.save_dir,
+            "model_path": model_path,
+            "model_type": resolved_model_type,
             "data_type": args.data_type,
             "batch_size": args.batch_size,
             "fps": args.fps,
@@ -586,4 +626,14 @@ if __name__ == "__main__":
 #   --data-path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy \
 #   --save-dir ./work_dirs/tokenizer/rvq_tfm_kin_0311 \
 #   --data-type pred \
-#   --num-var-plots 5
+#   --num-var-plots 5 \
+#   --model-type taae
+
+# python eval_tokenizer_by_scenario.py \
+#   --data-path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy \
+#   --save-dir ./work_dirs/tokenizer/rvq_tfm_accint_0423 \
+#   --data-type pred \
+#   --num-var-plots 5 \
+#   --model-type accint \
+#   --output-dir ./work_dirs/tokenizer/rvq_tfm_accint_0423/scenario_eval_accint
+
