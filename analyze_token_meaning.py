@@ -652,7 +652,10 @@ def compute_control_scores_for_quantity(series: np.ndarray, code_ranks: np.ndarr
         threshold = 0.1 * max_std
         persistence_score = float(np.mean(std_t > threshold))
 
-    control_score = float(spread_score * ordering_score * persistence_score)
+    # control_score 不再依赖 ordering_score。
+    # 原因：RVQ 的 code id 数值本身不具备天然顺序语义，直接用数值顺序约束会引入不稳妥假设。
+    # control_score = float(spread_score * ordering_score * persistence_score)
+    control_score = float(spread_score * persistence_score)
     return {
         "spread_score": spread_score,
         "ordering_score": ordering_score,
