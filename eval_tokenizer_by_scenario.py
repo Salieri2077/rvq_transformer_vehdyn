@@ -315,6 +315,41 @@ def scenario_metrics(gt_trajs: np.ndarray, pred_trajs: np.ndarray, dt: float) ->
     }
 
 
+def select_worst_reconstruction_indices(
+    trajs: np.ndarray,
+    recon_trajs: np.ndarray,
+    categories: Dict[str, np.ndarray],
+    num_samples: int,
+) -> Dict[str, List[Dict]]:
+    gt_xy = integrate_to_global(trajs)
+    pred_xy = integrate_to_global(recon_trajs)
+    step_dist_error = np.sqrt(np.sum((pred_xy - gt_xy) ** 2, axis=-1))
+    ade = step_dist_error.mean(axis=1)
+    fde = step_dist_error[:, -1]
+    max_error = step_dist_error.max(axis=1)
+
+    out = {}
+    for scenario_name, mask in categories.items():
+        idxs = np.where(mask)[0]
+        if len(idxs) == 0 or num_samples <= 0:
+            out[scenario_name] = []
+            continue
+
+        order = np.argsort(-ade[idxs])[:num_samples]
+        out[scenario_name] = [
+            {
+                "idx": int(idxs[i]),
+                "info": {
+                    "ade_m": float(ade[idxs[i]]),
+                    "fde_m": float(fde[idxs[i]]),
+                    "max_error_m": float(max_error[idxs[i]]),
+                },
+            }
+            for i in order
+        ]
+    return out
+
+
 def plot_representative_case(
     scenario_name: str,
     sample_idx: int,
@@ -410,6 +445,7 @@ def main():
     parser.add_argument("--dt", type=float, default=0.2)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--num-var-plots", type=int, default=3)
+    parser.add_argument("--num-worst-plots", type=int, default=3)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -444,6 +480,12 @@ def main():
         dt=args.dt,
         num_samples=args.num_var_plots,
         exclude_indices=representatives,
+    )
+    worst_representatives = select_worst_reconstruction_indices(
+        trajs=trajs,
+        recon_trajs=recon_trajs,
+        categories=categories,
+        num_samples=args.num_worst_plots,
     )
 
     metrics_by_scenario = {}
@@ -483,6 +525,16 @@ def main():
                 dt=args.dt,
                 save_path=os.path.join(output_dir, f"{scenario_name}_var{plot_id:02d}.png"),
             )
+        for plot_id, item in enumerate(worst_representatives[scenario_name], start=1):
+            worst_idx = item["idx"]
+            plot_representative_case(
+                scenario_name=f"{scenario_name} Worst{plot_id}",
+                sample_idx=worst_idx,
+                gt_traj=trajs[worst_idx],
+                pred_traj=recon_trajs[worst_idx],
+                dt=args.dt,
+                save_path=os.path.join(output_dir, f"{scenario_name}_worst_{plot_id:02d}.png"),
+            )
 
     overall_metrics = scenario_metrics(trajs, recon_trajs, dt=args.dt)
     summary = {
@@ -495,11 +547,13 @@ def main():
             "dt": args.dt,
             "output_dir": output_dir,
             "num_var_plots": args.num_var_plots,
+            "num_worst_plots": args.num_worst_plots,
         },
         "overall": overall_metrics,
         "scenarios": metrics_by_scenario,
         "representatives": representatives,
         "variation_representatives": variation_representatives,
+        "worst_representatives": worst_representatives,
         "token_shape": list(codes.shape),
     }
 
@@ -533,4 +587,3 @@ if __name__ == "__main__":
 #   --save-dir ./work_dirs/tokenizer/rvq_tfm_kin_0311 \
 #   --data-type pred \
 #   --num-var-plots 5
-
