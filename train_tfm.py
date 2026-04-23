@@ -429,7 +429,7 @@ def train_rvq_taae(
         print("Using FP16 mixed precision training")
 
     # 4. 训练循环设置
-    epochs = 250
+    epochs = 500
 
     # 学习率设置
     initial_lr = 1e-3
@@ -511,8 +511,10 @@ def train_rvq_taae(
                 recon_loss = mse_dxdy + 14.0 * mse_dyaw
 
                 # Loss 2: 真实动态监督
-                vel_loss = velocity_loss_from_dxdydyaw(x_recon, x, dt=model.dt)
-                acc_loss = acceleration_loss_from_dxdydyaw(x_recon, x, dt=model.dt)
+                pred_phys_for_loss = (x_recon * model.norm_scale * model.norm_std) + model.norm_mean
+                gt_phys_for_loss = (x * model.norm_scale * model.norm_std) + model.norm_mean
+                vel_loss = velocity_loss_from_dxdydyaw(pred_phys_for_loss, gt_phys_for_loss, dt=model.dt)
+                acc_loss = acceleration_loss_from_dxdydyaw(pred_phys_for_loss, gt_phys_for_loss, dt=model.dt)
 
                 pred_phys_for_loss = (x_recon * model.norm_scale * model.norm_std) + model.norm_mean
                 gt_phys_for_loss = (x * model.norm_scale * model.norm_std) + model.norm_mean
@@ -534,8 +536,8 @@ def train_rvq_taae(
                 # Loss weights
                 recon_loss_weight = 10.0
                 vq_loss_weight = 5.0
-                vel_loss_weight = 0.0
-                acc_loss_weight = 0.0
+                vel_loss_weight = 0.5
+                acc_loss_weight = 0.05
                 kin_smooth_weight = 1e-2 if epoch > 30 else 0.0
                 turn_global_weight = 1.0
                 turn_yaw_weight = 2.0
@@ -631,16 +633,16 @@ def train_rvq_taae(
         avg_weight = (
             10.0 * avg_recon
             + 5.0 * avg_vq
-            + 0.0 * avg_vel
-            + 0.0 * avg_acc
+            + 0.5 * avg_vel
+            + 0.05 * avg_acc
             + (1e-2 if epoch > 30 else 0.0) * avg_kin
             + 1.0 * avg_turn_global
             + 2.0 * avg_turn_yaw
         )
         writer.add_scalar("loss/weight_recon", 10.0 * avg_recon, epoch + 1)
         writer.add_scalar("loss/weight_vq", 5.0 * avg_vq, epoch + 1)
-        writer.add_scalar("loss/weight_vel", 0.0 * avg_vel, epoch + 1)
-        writer.add_scalar("loss/weight_acc", 0.0 * avg_acc, epoch + 1)
+        writer.add_scalar("loss/weight_vel", 0.5 * avg_vel, epoch + 1)
+        writer.add_scalar("loss/weight_acc", 0.05 * avg_acc, epoch + 1)
         writer.add_scalar("loss/weight_kin_smooth", (1e-2 if epoch > 30 else 0.0) * avg_kin, epoch + 1)
         writer.add_scalar("loss/weight_turn_global", 1.0 * avg_turn_global, epoch + 1)
         writer.add_scalar("loss/weight_turn_yaw", 2.0 * avg_turn_yaw, epoch + 1)
