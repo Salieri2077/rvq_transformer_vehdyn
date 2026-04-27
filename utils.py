@@ -7,21 +7,288 @@ from scipy.fft import dct, idct
 import torch
 import torch.nn.functional as F
 
+DEFAULT_BASE_DATA_PATH = "/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy"
+DEFAULT_AUGMENTED_DATA_PATH = (
+    "/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas_augmented_reverse_detour_directuturn_hs120.npy"
+)
 
-def load_sampled_datas():
-    # data_path = '/home/zhe.du/code/planner/nio_planner/nn2_tools/work_dirs/pca_tokenizer_dxdydyaw_highway_0122/sample_trajectorys_by_scenario.npy'
-    # data_path = '/share-global/zhe.du/planner/planNN2/tokenizer/0124_json/sample_trajectorys_by_scenario_update0210.npy'
-    data_path = '/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy'
-    data = np.load(data_path, allow_pickle=True).item()
-    datas = data['trajs']
-    return datas
 
-def load_test_datas():
-    # data_path = '/share-global/zhe.du/planner/planNN2/tokenizer/0124_json/sample_trajectorys_by_scenario_update0210.npy'
-    data_path = '/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy'
-    data = np.load(data_path, allow_pickle=True).item()
-    datas = data['trajs']
-    return datas
+def _load_traj_array(data_path: str) -> np.ndarray:
+    data = np.load(data_path, allow_pickle=True)
+    if isinstance(data, np.ndarray) and data.shape == ():
+        data = data.item()
+    if isinstance(data, dict) and "trajs" in data:
+        return np.asarray(data["trajs"])
+    return np.asarray(data)
+
+
+def resolve_default_data_path() -> str:
+    """优先使用增强数据，若不存在则回退到基础数据。"""
+    if os.path.exists(DEFAULT_AUGMENTED_DATA_PATH):
+        return DEFAULT_AUGMENTED_DATA_PATH
+    return DEFAULT_BASE_DATA_PATH
+
+
+def load_sampled_datas(data_path: str = None):
+    if data_path is None:
+        data_path = resolve_default_data_path()
+    return _load_traj_array(data_path)
+
+
+def load_test_datas(data_path: str = None):
+    if data_path is None:
+        data_path = resolve_default_data_path()
+    return _load_traj_array(data_path)
+
+
+def count_longitudinal_sign_changes(local_vx: np.ndarray, speed_th: float = 0.2) -> np.ndarray:
+    """统计纵向速度符号变化次数，忽略低速噪声段。"""
+    n = local_vx.shape[0]
+    out = np.zeros(n, dtype=np.int32)
+    for i in range(n):
+        signs = np.sign(local_vx[i])
+        valid = np.abs(local_vx[i]) >= speed_th
+        signs = signs[valid]
+        if signs.shape[0] <= 1:
+            continue
+        out[i] = int(np.sum(signs[1:] != signs[:-1]))
+    return out
+
+
+def compute_kinematic_profiles(trajs: np.ndarray, dt: float):
+    """
+    由 body-frame dxdydyaw 计算完整运动学 profile。
+    """
+    eps = 1e-8
+    clips = np.asarray(trajs, dtype=np.float32)
+    n, t, _ = clips.shape
+
+    dx = clips[:, :, 0]
+    dy = clips[:, :, 1]
+    dyaw = clips[:, :, 2]
+
+    yaw = np.cumsum(dyaw, axis=1)
+    prev_yaw = np.zeros_like(yaw)
+    if t > 1:
+        prev_yaw[:, 1:] = yaw[:, :-1]
+
+    cos_y = np.cos(prev_yaw)
+    sin_y = np.sin(prev_yaw)
+    dx_global = dx * cos_y - dy * sin_y
+    dy_global = dx * sin_y + dy * cos_y
+
+    disp_xy = np.stack([dx_global, dy_global], axis=-1)
+    xy = np.cumsum(disp_xy, axis=1)
+
+    vx = dx_global / (dt + eps)
+    vy = dy_global / (dt + eps)
+    speed = np.sqrt(vx**2 + vy**2 + 1e-6)
+
+    if t > 1:
+        raw_ax = np.diff(vx, axis=1) / (dt + eps)
+        raw_ay = np.diff(vy, axis=1) / (dt + eps)
+        ax = np.concatenate([raw_ax[:, :1], raw_ax], axis=1)
+        ay = np.concatenate([raw_ay[:, :1], raw_ay], axis=1)
+    else:
+        ax = np.zeros_like(vx)
+        ay = np.zeros_like(vy)
+    acc = np.sqrt(ax**2 + ay**2 + 1e-6)
+
+    yaw_rate = dyaw / (dt + eps)
+    if t > 1:
+        raw_yaw_acc = np.diff(yaw_rate, axis=1) / (dt + eps)
+        yaw_acc = np.concatenate([raw_yaw_acc[:, :1], raw_yaw_acc], axis=1)
+    else:
+        yaw_acc = np.zeros_like(yaw_rate)
+
+    curvature = (vx * ay - vy * ax) / (np.power(speed, 3) + eps)
+    curvature = np.where(speed < 0.2, 0.0, curvature)
+    curvature = np.clip(curvature, -2.0, 2.0)
+
+    local_vx = dx / (dt + eps)
+    local_vy = dy / (dt + eps)
+
+    return {
+        "xy": xy,
+        "disp_xy": disp_xy,
+        "yaw": yaw,
+        "prev_yaw": prev_yaw,
+        "vx": vx,
+        "vy": vy,
+        "speed": speed,
+        "ax": ax,
+        "ay": ay,
+        "acc": acc,
+        "yaw_rate": yaw_rate,
+        "yaw_acc": yaw_acc,
+        "curvature": curvature,
+        "local_vx": local_vx,
+        "local_vy": local_vy,
+    }
+
+
+def compute_motion_features(all_dxdydyaw_clips: np.ndarray, fps: float = 5.0, time_duration=None):
+    clips = np.asarray(all_dxdydyaw_clips, dtype=np.float32)
+    n, t, _ = clips.shape
+    duration = time_duration if time_duration is not None else (t / fps)
+    duration = max(float(duration), 1e-6)
+    dt = max(duration / max(t, 1), 1e-6)
+
+    profiles = compute_kinematic_profiles(clips, dt=dt)
+
+    dyaws = clips[:, :, 2]
+    cumulative_yaws = np.cumsum(dyaws, axis=1)
+    net_yaw = cumulative_yaws[:, -1] if t > 0 else np.zeros(n, dtype=np.float32)
+    gross_yaw = np.sum(np.abs(dyaws), axis=1)
+
+    step_d = np.sqrt(np.sum(profiles["disp_xy"] ** 2, axis=-1) + 1e-6)
+    total_dist = np.sum(step_d, axis=1)
+    avg_speed = total_dist / duration
+
+    s = np.sign(dyaws)
+    s[s == 0] = 1
+    sign_changes = np.sum(s[:, 1:] != s[:, :-1], axis=1) if t > 1 else np.zeros(n, dtype=np.int32)
+
+    speed = profiles["speed"]
+    acc = profiles["acc"]
+    curvature = profiles["curvature"]
+    local_vx = profiles["local_vx"]
+
+    reverse_mask = local_vx < -0.2
+    reverse_ratio = reverse_mask.mean(axis=1)
+    reverse_steps = reverse_mask.sum(axis=1)
+    reverse_dist = np.sum(np.abs(local_vx) * dt * reverse_mask, axis=1)
+    min_local_vx = np.min(local_vx, axis=1)
+
+    stop_mask = speed < 0.3
+    stop_ratio = stop_mask.mean(axis=1)
+    stop_steps = stop_mask.sum(axis=1)
+
+    long_vel_sign_changes = count_longitudinal_sign_changes(local_vx, speed_th=0.2)
+
+    has_reverse = (reverse_steps >= 2) | (reverse_dist > 0.5)
+    has_stop_or_near_stop = (stop_steps >= 1) | (np.min(speed, axis=1) < 0.3)
+
+    return {
+        "net_yaw": net_yaw,
+        "gross_yaw": gross_yaw,
+        "total_dist": total_dist,
+        "avg_speed": avg_speed,
+        "sign_changes": sign_changes,
+        "max_speed": np.max(speed, axis=1),
+        "min_speed": np.min(speed, axis=1),
+        "speed_std": np.std(speed, axis=1),
+        "mean_abs_acc": np.mean(np.abs(acc), axis=1),
+        "max_abs_acc": np.max(np.abs(acc), axis=1),
+        "avg_abs_curvature": np.mean(np.abs(curvature), axis=1),
+        "max_abs_curvature": np.max(np.abs(curvature), axis=1),
+        "reverse_ratio": reverse_ratio,
+        "reverse_steps": reverse_steps,
+        "reverse_dist": reverse_dist,
+        "min_local_vx": min_local_vx,
+        "stop_ratio": stop_ratio,
+        "stop_steps": stop_steps,
+        "long_vel_sign_changes": long_vel_sign_changes,
+        "has_reverse": has_reverse,
+        "has_stop_or_near_stop": has_stop_or_near_stop,
+    }
+
+
+def build_scenario_masks(all_trajs: np.ndarray, fps: float = 5.0):
+    feat = compute_motion_features(all_trajs, fps=fps)
+
+    net_yaw = feat["net_yaw"]
+    gross_yaw = feat["gross_yaw"]
+    total_dist = feat["total_dist"]
+    avg_speed = feat["avg_speed"]
+    sign_changes = feat["sign_changes"]
+    reverse_ratio = feat["reverse_ratio"]
+    reverse_dist = feat["reverse_dist"]
+    min_local_vx = feat["min_local_vx"]
+    stop_steps = feat["stop_steps"]
+    stop_ratio = feat["stop_ratio"]
+    long_vel_sign_changes = feat["long_vel_sign_changes"]
+    has_reverse = feat["has_reverse"]
+
+    th_dist_static = 1.0
+    reverse_dist_th = 0.5
+    reverse_ratio_th = 0.08
+    th_straight_net = 0.10
+    th_straight_gross = 0.20
+    v_10 = 10.0 / 3.6
+    v_80 = 80.0 / 3.6
+    v_120 = 120.0 / 3.6
+    th_turn = 0.35
+    th_uturn = 2.35
+    direct_uturn_min_speed = 2.0
+
+    mask_static = total_dist < th_dist_static
+    mask_reverse_base = (
+        (~mask_static)
+        & ((reverse_dist > reverse_dist_th) | (reverse_ratio > reverse_ratio_th) | (min_local_vx < -0.5))
+    )
+    mask_three_point_like = (
+        (~mask_static)
+        & has_reverse
+        & ((long_vel_sign_changes >= 1) | (stop_steps >= 1) | (stop_ratio > 0.05))
+        & (gross_yaw > 0.6)
+    )
+    mask_reverse = mask_reverse_base | mask_three_point_like
+
+    mask_direct_uturn = (
+        (~mask_static)
+        & (~mask_reverse)
+        & (np.abs(net_yaw) >= th_uturn)
+        & (avg_speed >= direct_uturn_min_speed)
+    )
+
+    remaining = (~mask_static) & (~mask_reverse) & (~mask_direct_uturn)
+    mask_detour = remaining & (np.abs(net_yaw) < 0.20) & (gross_yaw >= 0.80) & (sign_changes >= 2)
+
+    remaining = remaining & (~mask_detour)
+    mask_left = remaining & (net_yaw >= th_turn) & (np.abs(net_yaw) < th_uturn)
+    mask_right = remaining & (net_yaw <= -th_turn) & (np.abs(net_yaw) < th_uturn)
+
+    remaining = remaining & (~mask_left) & (~mask_right)
+    mask_straight = remaining & (np.abs(net_yaw) < th_straight_net) & (gross_yaw < th_straight_gross)
+    mask_low_straight = mask_straight & (avg_speed >= (v_10 - 2 / 3.6)) & (avg_speed <= (v_10 + 2 / 3.6))
+    mask_high_straight = mask_straight & (avg_speed >= (v_80 - 10 / 3.6)) & (avg_speed <= (v_80 + 10 / 3.6))
+    mask_high_straight_120 = mask_straight & (avg_speed >= (v_120 - 15 / 3.6)) & (avg_speed <= (v_120 + 15 / 3.6))
+
+    categories = {
+        "Stationary": mask_static,
+        "Reverse": mask_reverse,
+        "DirectUTurn": mask_direct_uturn,
+        "Detour": mask_detour,
+        "LeftTurn": mask_left,
+        "RightTurn": mask_right,
+        "LowSpeedStraight_10kmh": mask_low_straight,
+        "HighSpeedStraight_80kmh": mask_high_straight,
+        "HighSpeedStraight_120kmh": mask_high_straight_120,
+    }
+    return categories, feat
+
+
+def integrate_to_global(trajs: np.ndarray) -> np.ndarray:
+    dx = trajs[:, :, 0]
+    dy = trajs[:, :, 1]
+    dyaw = trajs[:, :, 2]
+    yaw = np.cumsum(dyaw, axis=1)
+    prev_yaw = np.zeros_like(yaw)
+    prev_yaw[:, 1:] = yaw[:, :-1]
+
+    dx_global = dx * np.cos(prev_yaw) - dy * np.sin(prev_yaw)
+    dy_global = dx * np.sin(prev_yaw) + dy * np.cos(prev_yaw)
+
+    x_global = np.cumsum(dx_global, axis=1)
+    y_global = np.cumsum(dy_global, axis=1)
+    return np.stack([x_global, y_global], axis=-1)
+
+
+def compute_speed_and_acc(trajs: np.ndarray, dt: float):
+    speed = np.sqrt(trajs[:, :, 0] ** 2 + trajs[:, :, 1] ** 2) / dt
+    acc = np.diff(speed, axis=1) / dt
+    return speed, acc
 
 def preprocess_and_save_norm_params(data_array, save_dir, data_type):
     """
