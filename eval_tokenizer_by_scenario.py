@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from train_tfm import TrajRVQTransformer
-from train_tfm_accint import AccBoundaryRVQTokenizer
+from train_tfm_accint import AccFirstRVQTokenizer
 
 
 def load_trajs(data_path: str) -> np.ndarray:
@@ -264,7 +264,7 @@ def compute_speed_and_acc(trajs: np.ndarray, dt: float) -> Tuple[np.ndarray, np.
     return speed, acc
 
 
-ModelUnion = Union[TrajRVQTransformer, AccBoundaryRVQTokenizer]
+ModelUnion = Union[TrajRVQTransformer, AccFirstRVQTokenizer]
 
 
 def reconstruct_trajs(
@@ -417,7 +417,7 @@ def infer_model_type(model_path: str, model_type: str) -> str:
 
 def build_model(model_path: str, input_steps: int, device: torch.device, model_type: str) -> ModelUnion:
     if model_type == "accint":
-        model = AccBoundaryRVQTokenizer(
+        model = AccFirstRVQTokenizer(
             input_steps=input_steps,
             input_dim=3,
             num_layers=15,
@@ -630,10 +630,9 @@ if __name__ == "__main__":
 #   --model-type taae
 
 # python eval_tokenizer_by_scenario.py \
-#   --data-path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy \
 #   --save-dir ./work_dirs/tokenizer/rvq_tfm_accint_0423 \
-#   --data-type pred \
-#   --num-var-plots 5 \
+#   --model-path ./work_dirs/tokenizer/rvq_tfm_accint_0423/pred_rvq_accint_model.pth \
 #   --model-type accint \
-#   --output-dir ./work_dirs/tokenizer/rvq_tfm_accint_0423/scenario_eval_accint
-
+#   --data-type pred \
+#   --dt 0.2 \
+#   --fps 5.0

@@ -6,7 +6,6 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
@@ -51,14 +50,71 @@ def integrate_local_to_global_with_yaw(dxdydyaw: torch.Tensor):
     return pos_xy_global, yaw, disp_xy_global
 
 
-class AccBoundaryRVQTokenizer(nn.Module):
+def compute_dynamics_from_dxdydyaw(dxdydyaw: torch.Tensor, dt: float):
+    """
+    从 body-frame dxdydyaw 计算动力学监督目标。
+
+    Args:
+        dxdydyaw: [B, T, 3], body 系每步增量 (dx, dy, dyaw)
+        dt:       时间步长
+
+    Returns:
+        dict, 至少包含:
+            pos_xy_global: [B, T, 2]
+            disp_xy_global:[B, T, 2]
+            yaw:           [B, T]
+            dyaw:          [B, T]
+            vel_xy:        [B, T, 2]
+            speed:         [B, T]
+            yaw_rate:      [B, T]
+            acc_xy:        [B, T, 2]
+            acc_yaw:       [B, T]
+            v0_xy:         [B, 2]
+            w0:            [B]
+    """
+    pos_xy_global, yaw, disp_xy_global = integrate_local_to_global_with_yaw(dxdydyaw)
+    dyaw = dxdydyaw[..., 2]
+
+    vel_xy = disp_xy_global / (dt + 1e-8)
+    speed = torch.sqrt((vel_xy[..., 0] ** 2 + vel_xy[..., 1] ** 2) + 1e-6)
+    v0_xy = vel_xy[:, 0, :]
+
+    yaw_rate = dyaw / (dt + 1e-8)
+    w0 = yaw_rate[:, 0]
+
+    if dxdydyaw.shape[1] > 1:
+        raw_acc_xy = (vel_xy[:, 1:, :] - vel_xy[:, :-1, :]) / (dt + 1e-8)
+        acc_xy = torch.cat([raw_acc_xy[:, :1, :], raw_acc_xy], dim=1)
+
+        raw_acc_yaw = (yaw_rate[:, 1:] - yaw_rate[:, :-1]) / (dt + 1e-8)
+        acc_yaw = torch.cat([raw_acc_yaw[:, :1], raw_acc_yaw], dim=1)
+    else:
+        acc_xy = torch.zeros_like(vel_xy)
+        acc_yaw = torch.zeros_like(yaw_rate)
+
+    return {
+        "pos_xy_global": pos_xy_global,
+        "disp_xy_global": disp_xy_global,
+        "yaw": yaw,
+        "dyaw": dyaw,
+        "vel_xy": vel_xy,
+        "speed": speed,
+        "yaw_rate": yaw_rate,
+        "acc_xy": acc_xy,
+        "acc_yaw": acc_yaw,
+        "v0_xy": v0_xy,
+        "w0": w0,
+    }
+
+
+class AccFirstRVQTokenizer(nn.Module):
     """
     思路：
-    1) Decoder 只预测加速度序列（ax, ay, alpha）和末端边界（end_x, end_y, end_yaw）；
-    2) 利用末端边界反解初速度（v0x, v0y, w0）；
-    3) 积分得到速度、位移、航向，再反投影到 body 系得到 dxdydyaw。
+    1) Decoder 预测加速度序列（ax, ay, alpha）与初始速度（v0x, v0y, w0）；
+    2) 通过积分恢复速度、位移、yaw；
+    3) 再反投影到 body 系得到 dxdydyaw。
 
-    这样可把“首尾位置约束”直接注入重建过程。
+    训练主目标放在动力学一致性（acc/vel/yaw-rate），轨迹路径作为辅助项。
     """
 
     def __init__(
@@ -127,17 +183,17 @@ class AccBoundaryRVQTokenizer(nn.Module):
             decoder_layer, num_layers=num_transformer_layers
         )
 
-        # 预测加速度与末端边界
+        # 预测加速度与初始速度
         self.acc_xy_head = nn.Linear(d_model, input_steps * 2)
         self.acc_yaw_head = nn.Linear(d_model, input_steps)
-        self.end_xy_head = nn.Linear(d_model, 2)
-        self.end_yaw_head = nn.Linear(d_model, 1)
+        self.v0_xy_head = nn.Linear(d_model, 2)
+        self.w0_head = nn.Linear(d_model, 1)
 
         # 参数范围（物理先验）
         self.acc_xy_scale = 8.0      # m/s^2
-        self.acc_yaw_scale = 1.2     # rad/s^2
-        self.end_xy_scale = 250.0    # m
-        self.end_yaw_scale = 4.5     # rad
+        self.acc_yaw_scale = 1.5     # rad/s^2
+        self.v0_scale = 45.0         # m/s
+        self.w0_scale = 1.5          # rad/s
 
         # 归一化参数 buffer（state_dict 可保存）
         self.register_buffer("norm_mean", torch.zeros(1, 1, 3))
@@ -176,50 +232,34 @@ class AccBoundaryRVQTokenizer(nn.Module):
         acc_yaw = self.acc_yaw_head(h_dec)
         acc_yaw = torch.tanh(acc_yaw) * self.acc_yaw_scale
 
-        end_xy = self.end_xy_head(h_dec)
-        end_xy = torch.tanh(end_xy) * self.end_xy_scale
+        v0_xy = self.v0_xy_head(h_dec)
+        v0_xy = torch.tanh(v0_xy) * self.v0_scale
 
-        end_yaw = self.end_yaw_head(h_dec).squeeze(-1)
-        end_yaw = torch.tanh(end_yaw) * self.end_yaw_scale
+        w0 = self.w0_head(h_dec).squeeze(-1)
+        w0 = torch.tanh(w0) * self.w0_scale
 
-        return acc_xy, acc_yaw, end_xy, end_yaw
+        return acc_xy, acc_yaw, v0_xy, w0
 
-    def _rollout_with_boundary(
+    def _rollout_with_dynamics(
         self,
         acc_xy: torch.Tensor,
         acc_yaw: torch.Tensor,
-        end_xy: torch.Tensor,
-        end_yaw: torch.Tensor,
+        v0_xy: torch.Tensor,
+        w0: torch.Tensor,
     ):
         """
-        根据加速度和末端边界反解初速度，然后积分得到轨迹。
-
-        离散形式：
-            v_t = v0 + dt * cumsum(a)_t
-            p_T = sum_t (v_t * dt)
-        =>  v0 = (p_T - dt^2 * sum_t cumsum(a)_t) / (T * dt)
+        根据加速度与初始速度积分得到速度、位移和姿态。
         """
         dt = self.dt
-        t_steps = self.input_steps
-        denom = t_steps * dt + 1e-8
+        acc_xy_cum = torch.cumsum(acc_xy, dim=1)
+        vel_xy = v0_xy.unsqueeze(1) + dt * acc_xy_cum
+        disp_xy_global = vel_xy * dt
+        pos_xy_global = torch.cumsum(disp_xy_global, dim=1)
 
-        # XY 部分（全局系）
-        acc_xy_cum = torch.cumsum(acc_xy, dim=1)                # [B, T, 2]
-        acc_xy_term = (dt * dt) * torch.sum(acc_xy_cum, dim=1)  # [B, 2]
-        v0_xy = (end_xy - acc_xy_term) / denom                  # [B, 2]
-
-        vel_xy = v0_xy.unsqueeze(1) + dt * acc_xy_cum           # [B, T, 2]
-        disp_xy_global = vel_xy * dt                             # [B, T, 2]
-        pos_xy_global = torch.cumsum(disp_xy_global, dim=1)      # [B, T, 2]
-
-        # Yaw 部分
-        acc_yaw_cum = torch.cumsum(acc_yaw, dim=1)               # [B, T]
-        acc_yaw_term = (dt * dt) * torch.sum(acc_yaw_cum, dim=1) # [B]
-        w0 = (end_yaw - acc_yaw_term) / denom                    # [B]
-
-        yaw_rate = w0.unsqueeze(1) + dt * acc_yaw_cum            # [B, T]
-        dyaw = yaw_rate * dt                                     # [B, T]
-        yaw = torch.cumsum(dyaw, dim=1)                          # [B, T]
+        acc_yaw_cum = torch.cumsum(acc_yaw, dim=1)
+        yaw_rate = w0.unsqueeze(1) + dt * acc_yaw_cum
+        dyaw = yaw_rate * dt
+        yaw = torch.cumsum(dyaw, dim=1)
 
         prev_yaw = torch.zeros_like(yaw)
         prev_yaw[:, 1:] = yaw[:, :-1]
@@ -237,7 +277,7 @@ class AccBoundaryRVQTokenizer(nn.Module):
         x_phys = torch.stack([dx_local, dy_local, dyaw], dim=-1)  # [B, T, 3]
         x_norm = self.to_norm(x_phys)
 
-        speed = torch.norm(vel_xy, dim=-1)  # [B, T]
+        speed = torch.sqrt((vel_xy[..., 0] ** 2 + vel_xy[..., 1] ** 2) + 1e-6)  # [B, T]
 
         aux = {
             "acc_xy": acc_xy,
@@ -246,11 +286,11 @@ class AccBoundaryRVQTokenizer(nn.Module):
             "w0": w0,
             "vel_xy": vel_xy,
             "speed": speed,
+            "yaw_rate": yaw_rate,
+            "dyaw": dyaw,
             "disp_xy_global": disp_xy_global,
             "pos_xy_global": pos_xy_global,
             "yaw": yaw,
-            "end_xy": end_xy,
-            "end_yaw": end_yaw,
         }
         return x_norm, aux
 
@@ -259,12 +299,14 @@ class AccBoundaryRVQTokenizer(nn.Module):
         h_dec = h_dec + self.decoder_pos_embed
         h_dec = self.transformer_decoder(h_dec).squeeze(1)
 
-        acc_xy, acc_yaw, end_xy, end_yaw = self._decode_heads(h_dec)
-        return self._rollout_with_boundary(acc_xy, acc_yaw, end_xy, end_yaw)
+        acc_xy, acc_yaw, v0_xy, w0 = self._decode_heads(h_dec)
+        return self._rollout_with_dynamics(acc_xy, acc_yaw, v0_xy, w0)
 
-    def decode_from_codes(self, codes: torch.Tensor):
+    def decode_from_codes(self, codes: torch.Tensor, return_aux: bool = False):
         z_q = self.rvq.decode_from_codes(codes)
-        x_recon, _ = self._decode_from_latent(z_q)
+        x_recon, aux = self._decode_from_latent(z_q)
+        if return_aux:
+            return x_recon, aux
         return x_recon
 
     def forward(self, x: torch.Tensor):
@@ -276,7 +318,7 @@ class AccBoundaryRVQTokenizer(nn.Module):
 
 def train_rvq_accint(
     data_array: np.ndarray,
-    save_dir: str = "./work_dirs/tokenizer/rvq_tfm_accint",
+    save_dir: str = "./work_dirs/tokenizer/rvq_tfm_accfirst",
     data_type: str = "pred",
     batch_size: int = 4096,
 ):
@@ -303,7 +345,7 @@ def train_rvq_accint(
     dataloader = DataLoader(dataset, **dataloader_kwargs)
 
     # 3) 模型
-    model = AccBoundaryRVQTokenizer(
+    model = AccFirstRVQTokenizer(
         input_steps=num_steps,
         input_dim=data_array.shape[2],
         num_layers=15,
@@ -369,7 +411,7 @@ def train_rvq_accint(
         f"std={std.squeeze().cpu().numpy()}, scale={scale_factor.squeeze().cpu().numpy()}"
     )
 
-    print("Start Training (Acceleration-Integration RVQ Tokenizer)...")
+    print("Start Training (Acceleration-first RVQ Tokenizer)...")
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
     writer = SummaryWriter(log_dir=os.path.join(save_dir, "tensorboard", run_name))
 
@@ -378,23 +420,31 @@ def train_rvq_accint(
     for epoch in range(epochs):
         model.train()
 
-        total_recon = 0.0
+        total_acc_xy = 0.0
+        total_acc_yaw = 0.0
+        total_v0 = 0.0
+        total_w0 = 0.0
+        total_vel = 0.0
+        total_speed = 0.0
+        total_yaw_rate = 0.0
+        total_yaw = 0.0
         total_vq = 0.0
-        total_end_xy = 0.0
-        total_end_yaw = 0.0
         total_traj = 0.0
         total_final_pos = 0.0
-        total_speed_boundary = 0.0
-        total_speed_profile = 0.0
-        total_acc_smooth = 0.0
+        total_recon = 0.0
+        total_jerk_smooth = 0.0
         total_speed_weight = 0.0
 
         total_ade = 0.0
         total_fde = 0.0
         total_vrr_count = 0
         total_samples = 0
+        total_pred_speed_mean = 0.0
+        total_gt_speed_mean = 0.0
+        total_pred_acc_mean = 0.0
+        total_gt_acc_mean = 0.0
 
-        if epoch > epochs * 0.8:
+        if epoch > epochs * 0.6:
             model.rvq.dropout = 0.0
 
         for batch in dataloader:
@@ -404,97 +454,131 @@ def train_rvq_accint(
             with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
                 x_recon, vq_loss, _, aux = model(x)
 
-                # ------- GT 转物理空间并积分出边界 -------
+                # ------- GT 转物理空间并计算动力学监督 -------
                 gt_phys = model.to_phys(x)
-                gt_pos_xy, gt_yaw, _ = integrate_local_to_global_with_yaw(gt_phys)
-                gt_end_xy = gt_pos_xy[:, -1, :]
-                gt_end_yaw = gt_yaw[:, -1]
-                gt_speed = torch.sqrt(gt_phys[..., 0] ** 2 + gt_phys[..., 1] ** 2 + 1e-6) / model.dt
-                gt_avg_speed = gt_speed.mean(dim=1)
+                gt_dyn = compute_dynamics_from_dxdydyaw(gt_phys, dt=model.dt)
 
-                # 速度/转向感知权重：提高高速与大转向样本在 batch 内的话语权
+                # 速度/转向/加速度感知权重：提高动态更激烈样本的话语权
+                gt_avg_speed = gt_dyn["speed"].mean(dim=1)
+                gt_final_yaw = gt_dyn["yaw"][:, -1]
+                gt_mean_abs_acc = torch.sqrt(
+                    (gt_dyn["acc_xy"][..., 0] ** 2 + gt_dyn["acc_xy"][..., 1] ** 2) + 1e-6
+                ).mean(dim=1)
                 speed_weight = 1.0 + torch.clamp(gt_avg_speed / 15.0, min=0.0, max=2.5)
-                turn_weight = 1.0 + torch.clamp(gt_end_yaw.abs() / 1.2, min=0.0, max=1.5)
-                sample_weight = torch.clamp(0.75 * speed_weight + 0.25 * turn_weight, min=1.0, max=4.0)
+                turn_weight = 1.0 + torch.clamp(gt_final_yaw.abs() / 1.2, min=0.0, max=1.5)
+                acc_weight = 1.0 + torch.clamp(gt_mean_abs_acc / 2.0, min=0.0, max=1.5)
+                sample_weight = torch.clamp(
+                    0.45 * speed_weight + 0.35 * turn_weight + 0.20 * acc_weight, min=1.0, max=4.0
+                )
 
-                # ------- 1) 重建损失（归一化空间） -------
+                # ------- 1) acceleration-first 主损失 -------
+                acc_xy_mse_per_sample = (aux["acc_xy"] - gt_dyn["acc_xy"]).pow(2).mean(dim=(1, 2))
+                acc_xy_loss = (acc_xy_mse_per_sample * sample_weight).mean()
+
+                acc_yaw_mse_per_sample = (aux["acc_yaw"] - gt_dyn["acc_yaw"]).pow(2).mean(dim=1)
+                acc_yaw_loss = (acc_yaw_mse_per_sample * sample_weight).mean()
+
+                # ------- 2) 初始状态损失 -------
+                v0_mse_per_sample = (aux["v0_xy"] - gt_dyn["v0_xy"]).pow(2).mean(dim=1)
+                v0_loss = (v0_mse_per_sample * sample_weight).mean()
+
+                w0_mse_per_sample = (aux["w0"] - gt_dyn["w0"]).pow(2)
+                w0_loss = (w0_mse_per_sample * sample_weight).mean()
+
+                # ------- 3) 速度一致性 -------
+                vel_mse_per_sample = (aux["vel_xy"] - gt_dyn["vel_xy"]).pow(2).mean(dim=(1, 2))
+                vel_loss = (vel_mse_per_sample * sample_weight).mean()
+
+                speed_mse_per_sample = (aux["speed"] - gt_dyn["speed"]).pow(2).mean(dim=1)
+                speed_loss = (speed_mse_per_sample * sample_weight).mean()
+
+                # ------- 4) yaw 一致性 -------
+                yaw_rate_mse_per_sample = (aux["yaw_rate"] - gt_dyn["yaw_rate"]).pow(2).mean(dim=1)
+                yaw_rate_loss = (yaw_rate_mse_per_sample * sample_weight).mean()
+
+                yaw_mse_per_sample = (aux["yaw"] - gt_dyn["yaw"]).pow(2).mean(dim=1)
+                yaw_loss = (yaw_mse_per_sample * sample_weight).mean()
+
+                # ------- 5) 路径辅助 -------
+                traj_err2_per_sample = (aux["pos_xy_global"] - gt_dyn["pos_xy_global"]).pow(2).mean(dim=(1, 2))
+                traj_global_loss = (traj_err2_per_sample * sample_weight).mean()
+
+                final_pos_err2 = (
+                    aux["pos_xy_global"][:, -1, :] - gt_dyn["pos_xy_global"][:, -1, :]
+                ).pow(2).mean(dim=1)
+                final_pos_loss = (final_pos_err2 * sample_weight).mean()
+
+                # ------- 6) local dxdydyaw 辅助 -------
                 mse_dxdy_per_sample = (x_recon[..., :2] - x[..., :2]).pow(2).mean(dim=(1, 2))
                 mse_dyaw_per_sample = (x_recon[..., 2] - x[..., 2]).pow(2).mean(dim=1)
                 recon_loss = ((mse_dxdy_per_sample + 14.0 * mse_dyaw_per_sample) * sample_weight).mean()
 
-                # ------- 2) 末端边界损失 -------
-                end_xy_err2 = (aux["end_xy"] - gt_end_xy).pow(2).sum(dim=1)
-                end_xy_loss = (end_xy_err2 * sample_weight).mean()
-                end_yaw_err2 = (aux["end_yaw"] - gt_end_yaw).pow(2)
-                end_yaw_loss = (end_yaw_err2 * turn_weight).mean()
-
-                # ------- 3) 全局轨迹损失 -------
-                traj_err2_per_sample = (aux["pos_xy_global"] - gt_pos_xy).pow(2).sum(dim=2).mean(dim=1)
-                traj_global_loss = (traj_err2_per_sample * sample_weight).mean()
-                final_pos_err2 = (aux["pos_xy_global"][:, -1, :] - gt_end_xy).pow(2).sum(dim=1)
-                final_pos_loss = (final_pos_err2 * sample_weight).mean()
-
-                # ------- 4) 速度约束（由首尾位置得到平均速度） -------
-                target_avg_speed = torch.norm(gt_end_xy, dim=-1) / (model.input_steps * model.dt + 1e-8)
-                pred_avg_speed = aux["speed"].mean(dim=1)
-                speed_boundary_loss = ((pred_avg_speed - target_avg_speed).pow(2) * speed_weight).mean()
-
-                # 速度 profile 约束（辅助稳定收敛）
-                pred_phys = model.to_phys(x_recon)
-                pred_speed = torch.sqrt(pred_phys[..., 0] ** 2 + pred_phys[..., 1] ** 2 + 1e-6) / model.dt
-                speed_profile_mse = (pred_speed - gt_speed).pow(2).mean(dim=1)
-                speed_profile_loss = (speed_profile_mse * speed_weight).mean()
-
-                # ------- 5) 加速度平滑项 -------
+                # ------- 7) jerk 平滑 -------
                 if model.input_steps > 1:
                     jerk_xy = (aux["acc_xy"][:, 1:, :] - aux["acc_xy"][:, :-1, :]) / model.dt
                     jerk_yaw = (aux["acc_yaw"][:, 1:] - aux["acc_yaw"][:, :-1]) / model.dt
-                    acc_smooth_loss = jerk_xy.pow(2).mean() + jerk_yaw.pow(2).mean()
+                    jerk_smooth_loss = jerk_xy.pow(2).mean() + jerk_yaw.pow(2).mean()
                 else:
-                    acc_smooth_loss = aux["acc_xy"].sum() * 0.0
+                    jerk_smooth_loss = aux["acc_xy"].sum() * 0.0
 
-                # 分阶段 loss 权重：前期优先轨迹/末端收敛，后期加强码本压缩
-                if epoch < 20:
-                    recon_w = 12.0
-                    vq_w = 1.5
-                    end_xy_w = 3.0
-                    end_yaw_w = 1.5
-                    traj_w = 4.0
-                    final_pos_w = 3.0
-                    speed_boundary_w = 2.0
-                    speed_profile_w = 1.0
-                    acc_smooth_w = 0.0
-                elif epoch < 80:
-                    recon_w = 10.0
+                # 分阶段 loss 权重：保持 acc 相关项为主导，路径项为辅助
+                if epoch < 30:
+                    acc_xy_w = 8.0
+                    acc_yaw_w = 4.0
+                    v0_w = 3.0
+                    w0_w = 2.0
+                    vel_w = 2.0
+                    speed_w = 1.5
+                    yaw_rate_w = 1.5
+                    yaw_w = 0.8
+                    traj_w = 1.0
+                    final_pos_w = 1.0
+                    recon_w = 2.0
+                    vq_w = 1.0
+                    jerk_w = 0.0
+                elif epoch < 100:
+                    acc_xy_w = 6.0
+                    acc_yaw_w = 3.0
+                    v0_w = 2.0
+                    w0_w = 1.5
+                    vel_w = 2.0
+                    speed_w = 1.2
+                    yaw_rate_w = 1.2
+                    yaw_w = 1.0
+                    traj_w = 1.5
+                    final_pos_w = 1.0
+                    recon_w = 2.0
                     vq_w = 3.0
-                    end_xy_w = 2.5
-                    end_yaw_w = 1.2
-                    traj_w = 3.0
-                    final_pos_w = 2.0
-                    speed_boundary_w = 1.5
-                    speed_profile_w = 0.8
-                    acc_smooth_w = 0.0
+                    jerk_w = 0.0
                 else:
-                    recon_w = 8.0
-                    vq_w = 5.0
-                    end_xy_w = 2.0
-                    end_yaw_w = 1.0
-                    traj_w = 2.5
+                    acc_xy_w = 5.0
+                    acc_yaw_w = 2.5
+                    v0_w = 1.5
+                    w0_w = 1.0
+                    vel_w = 1.5
+                    speed_w = 1.0
+                    yaw_rate_w = 1.0
+                    yaw_w = 1.0
+                    traj_w = 2.0
                     final_pos_w = 1.5
-                    speed_boundary_w = 1.2
-                    speed_profile_w = 0.6
-                    acc_smooth_w = 5e-4 if epoch > 120 else 0.0
+                    recon_w = 2.0
+                    vq_w = 5.0
+                    jerk_w = 5e-4
 
                 loss = (
-                    recon_w * recon_loss
-                    + vq_w * vq_loss
-                    + end_xy_w * end_xy_loss
-                    + end_yaw_w * end_yaw_loss
+                    acc_xy_w * acc_xy_loss
+                    + acc_yaw_w * acc_yaw_loss
+                    + v0_w * v0_loss
+                    + w0_w * w0_loss
+                    + vel_w * vel_loss
+                    + speed_w * speed_loss
+                    + yaw_rate_w * yaw_rate_loss
+                    + yaw_w * yaw_loss
                     + traj_w * traj_global_loss
                     + final_pos_w * final_pos_loss
-                    + speed_boundary_w * speed_boundary_loss
-                    + speed_profile_w * speed_profile_loss
-                    + acc_smooth_w * acc_smooth_loss
+                    + recon_w * recon_loss
+                    + vq_w * vq_loss
+                    + jerk_w * jerk_smooth_loss
                 )
 
             if use_amp and amp_dtype == torch.float16:
@@ -508,110 +592,163 @@ def train_rvq_accint(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
-            total_recon += recon_loss.item()
+            total_acc_xy += acc_xy_loss.item()
+            total_acc_yaw += acc_yaw_loss.item()
+            total_v0 += v0_loss.item()
+            total_w0 += w0_loss.item()
+            total_vel += vel_loss.item()
+            total_speed += speed_loss.item()
+            total_yaw_rate += yaw_rate_loss.item()
+            total_yaw += yaw_loss.item()
             total_vq += vq_loss.item()
-            total_end_xy += end_xy_loss.item()
-            total_end_yaw += end_yaw_loss.item()
             total_traj += traj_global_loss.item()
             total_final_pos += final_pos_loss.item()
-            total_speed_boundary += speed_boundary_loss.item()
-            total_speed_profile += speed_profile_loss.item()
-            total_acc_smooth += acc_smooth_loss.item()
-            total_speed_weight += speed_weight.mean().item()
+            total_recon += recon_loss.item()
+            total_jerk_smooth += jerk_smooth_loss.item()
+            total_speed_weight += sample_weight.mean().item()
 
             # 指标：ADE / FDE / VRR
             with torch.no_grad():
-                step_err = torch.norm(aux["pos_xy_global"] - gt_pos_xy, dim=-1)  # [B, T]
+                step_err = torch.sqrt(
+                    ((aux["pos_xy_global"] - gt_dyn["pos_xy_global"]).pow(2).sum(dim=-1)) + 1e-6
+                )  # [B, T]
                 ade = step_err.mean(dim=1).mean().item()
                 fde = step_err[:, -1].mean().item()
                 valid = (step_err.max(dim=1)[0] < max_lateral).sum().item()
+                pred_acc_abs = torch.sqrt(
+                    (aux["acc_xy"][..., 0] ** 2 + aux["acc_xy"][..., 1] ** 2) + 1e-6
+                ).mean().item()
+                gt_acc_abs = torch.sqrt(
+                    (gt_dyn["acc_xy"][..., 0] ** 2 + gt_dyn["acc_xy"][..., 1] ** 2) + 1e-6
+                ).mean().item()
 
                 total_ade += ade
                 total_fde += fde
                 total_vrr_count += valid
                 total_samples += x.shape[0]
+                total_pred_speed_mean += aux["speed"].mean().item()
+                total_gt_speed_mean += gt_dyn["speed"].mean().item()
+                total_pred_acc_mean += pred_acc_abs
+                total_gt_acc_mean += gt_acc_abs
 
         scheduler.step()
 
-        avg_recon = total_recon / len(dataloader)
+        avg_acc_xy = total_acc_xy / len(dataloader)
+        avg_acc_yaw = total_acc_yaw / len(dataloader)
+        avg_v0 = total_v0 / len(dataloader)
+        avg_w0 = total_w0 / len(dataloader)
+        avg_vel = total_vel / len(dataloader)
+        avg_speed = total_speed / len(dataloader)
+        avg_yaw_rate = total_yaw_rate / len(dataloader)
+        avg_yaw = total_yaw / len(dataloader)
         avg_vq = total_vq / len(dataloader)
-        avg_end_xy = total_end_xy / len(dataloader)
-        avg_end_yaw = total_end_yaw / len(dataloader)
         avg_traj = total_traj / len(dataloader)
         avg_final_pos = total_final_pos / len(dataloader)
-        avg_speed_boundary = total_speed_boundary / len(dataloader)
-        avg_speed_profile = total_speed_profile / len(dataloader)
-        avg_acc_smooth = total_acc_smooth / len(dataloader)
+        avg_recon = total_recon / len(dataloader)
+        avg_jerk_smooth = total_jerk_smooth / len(dataloader)
         avg_speed_weight = total_speed_weight / len(dataloader)
+        avg_ade = total_ade / len(dataloader)
+        avg_fde = total_fde / len(dataloader)
+        vrr = total_vrr_count / total_samples if total_samples > 0 else 0.0
+        avg_pred_speed_mean = total_pred_speed_mean / len(dataloader)
+        avg_gt_speed_mean = total_gt_speed_mean / len(dataloader)
+        avg_pred_acc_mean = total_pred_acc_mean / len(dataloader)
+        avg_gt_acc_mean = total_gt_acc_mean / len(dataloader)
 
-        if epoch < 20:
-            recon_w, vq_w = 12.0, 1.5
-            end_xy_w, end_yaw_w = 3.0, 1.5
-            traj_w, final_pos_w = 4.0, 3.0
-            speed_boundary_w, speed_profile_w = 2.0, 1.0
-            acc_smooth_w = 0.0
-        elif epoch < 80:
-            recon_w, vq_w = 10.0, 3.0
-            end_xy_w, end_yaw_w = 2.5, 1.2
-            traj_w, final_pos_w = 3.0, 2.0
-            speed_boundary_w, speed_profile_w = 1.5, 0.8
-            acc_smooth_w = 0.0
+        if epoch < 30:
+            acc_xy_w = 8.0
+            acc_yaw_w = 4.0
+            v0_w = 3.0
+            w0_w = 2.0
+            vel_w = 2.0
+            speed_w = 1.5
+            yaw_rate_w = 1.5
+            yaw_w = 0.8
+            traj_w = 1.0
+            final_pos_w = 1.0
+            recon_w = 2.0
+            vq_w = 1.0
+            jerk_w = 0.0
+        elif epoch < 100:
+            acc_xy_w = 6.0
+            acc_yaw_w = 3.0
+            v0_w = 2.0
+            w0_w = 1.5
+            vel_w = 2.0
+            speed_w = 1.2
+            yaw_rate_w = 1.2
+            yaw_w = 1.0
+            traj_w = 1.5
+            final_pos_w = 1.0
+            recon_w = 2.0
+            vq_w = 3.0
+            jerk_w = 0.0
         else:
-            recon_w, vq_w = 8.0, 5.0
-            end_xy_w, end_yaw_w = 2.0, 1.0
-            traj_w, final_pos_w = 2.5, 1.5
-            speed_boundary_w, speed_profile_w = 1.2, 0.6
-            acc_smooth_w = 5e-4 if epoch > 120 else 0.0
+            acc_xy_w = 5.0
+            acc_yaw_w = 2.5
+            v0_w = 1.5
+            w0_w = 1.0
+            vel_w = 1.5
+            speed_w = 1.0
+            yaw_rate_w = 1.0
+            yaw_w = 1.0
+            traj_w = 2.0
+            final_pos_w = 1.5
+            recon_w = 2.0
+            vq_w = 5.0
+            jerk_w = 5e-4
 
         weighted_loss = (
-            recon_w * avg_recon
-            + vq_w * avg_vq
-            + end_xy_w * avg_end_xy
-            + end_yaw_w * avg_end_yaw
+            acc_xy_w * avg_acc_xy
+            + acc_yaw_w * avg_acc_yaw
+            + v0_w * avg_v0
+            + w0_w * avg_w0
+            + vel_w * avg_vel
+            + speed_w * avg_speed
+            + yaw_rate_w * avg_yaw_rate
+            + yaw_w * avg_yaw
             + traj_w * avg_traj
             + final_pos_w * avg_final_pos
-            + speed_boundary_w * avg_speed_boundary
-            + speed_profile_w * avg_speed_profile
-            + acc_smooth_w * avg_acc_smooth
+            + recon_w * avg_recon
+            + vq_w * avg_vq
+            + jerk_w * avg_jerk_smooth
         )
 
-        writer.add_scalar("loss/recon", avg_recon, epoch + 1)
-        writer.add_scalar("loss/vq", avg_vq, epoch + 1)
-        writer.add_scalar("loss/end_xy", avg_end_xy, epoch + 1)
-        writer.add_scalar("loss/end_yaw", avg_end_yaw, epoch + 1)
+        writer.add_scalar("loss/acc_xy", avg_acc_xy, epoch + 1)
+        writer.add_scalar("loss/acc_yaw", avg_acc_yaw, epoch + 1)
+        writer.add_scalar("loss/v0", avg_v0, epoch + 1)
+        writer.add_scalar("loss/w0", avg_w0, epoch + 1)
+        writer.add_scalar("loss/vel", avg_vel, epoch + 1)
+        writer.add_scalar("loss/speed", avg_speed, epoch + 1)
+        writer.add_scalar("loss/yaw_rate", avg_yaw_rate, epoch + 1)
+        writer.add_scalar("loss/yaw", avg_yaw, epoch + 1)
         writer.add_scalar("loss/traj_global", avg_traj, epoch + 1)
         writer.add_scalar("loss/final_pos", avg_final_pos, epoch + 1)
-        writer.add_scalar("loss/speed_boundary", avg_speed_boundary, epoch + 1)
-        writer.add_scalar("loss/speed_profile", avg_speed_profile, epoch + 1)
-        writer.add_scalar("loss/acc_smooth", avg_acc_smooth, epoch + 1)
+        writer.add_scalar("loss/recon", avg_recon, epoch + 1)
+        writer.add_scalar("loss/vq", avg_vq, epoch + 1)
+        writer.add_scalar("loss/jerk_smooth", avg_jerk_smooth, epoch + 1)
         writer.add_scalar("loss/weighted", weighted_loss, epoch + 1)
 
         if (epoch + 1) % 10 == 0:
-            avg_ade = total_ade / len(dataloader)
-            avg_fde = total_fde / len(dataloader)
-            vrr = total_vrr_count / total_samples if total_samples > 0 else 0.0
-            with torch.no_grad():
-                mean_speed = aux["speed"].mean().item()
-                mean_end_dist = torch.norm(aux["end_xy"], dim=-1).mean().item()
-                mean_acc = aux["acc_xy"].norm(dim=-1).mean().item()
-
             print(
-                f"[AccIntRVQ] Epoch {epoch+1:03d} | "
-                f"Recon: {avg_recon:.5f} | VQ: {avg_vq:.5f} | "
-                f"EndXY: {avg_end_xy:.5f} | EndYaw: {avg_end_yaw:.5f} | "
-                f"Traj: {avg_traj:.5f} | FinalPos: {avg_final_pos:.5f} | SpeedB: {avg_speed_boundary:.5f} | "
-                f"SpeedP: {avg_speed_profile:.5f} | AccSmooth: {avg_acc_smooth:.5f} | "
+                f"[AccFirstRVQ] Epoch {epoch+1:03d} | "
+                f"AccXY: {avg_acc_xy:.5f} | AccYaw: {avg_acc_yaw:.5f} | "
+                f"V0: {avg_v0:.5f} | W0: {avg_w0:.5f} | "
+                f"Vel: {avg_vel:.5f} | Speed: {avg_speed:.5f} | "
+                f"YawRate: {avg_yaw_rate:.5f} | Yaw: {avg_yaw:.5f} | "
+                f"Traj: {avg_traj:.5f} | FinalPos: {avg_final_pos:.5f} | "
+                f"Recon: {avg_recon:.5f} | VQ: {avg_vq:.5f} | Jerk: {avg_jerk_smooth:.5f} | "
                 f"ADE: {avg_ade:.4f} m | FDE: {avg_fde:.4f} m | VRR: {vrr:.4f} | "
-                f"speed_mean: {mean_speed:.2f} m/s | end_dist_mean: {mean_end_dist:.2f} m | "
-                f"speed_w: {avg_speed_weight:.2f} | "
-                f"|acc|_mean: {mean_acc:.2f}"
+                f"pred_speed_mean: {avg_pred_speed_mean:.2f} m/s | gt_speed_mean: {avg_gt_speed_mean:.2f} m/s | "
+                f"pred_acc_mean: {avg_pred_acc_mean:.2f} m/s^2 | gt_acc_mean: {avg_gt_acc_mean:.2f} m/s^2 | "
+                f"sample_w: {avg_speed_weight:.2f}"
             )
 
     # 保存模型
     model_path = os.path.join(save_dir, f"{data_type}_rvq_accint_model.pth")
     torch.save(model.state_dict(), model_path)
     writer.close()
-    print(f"Acceleration-Integration RVQ training done. Model saved to {model_path}")
+    print(f"Acceleration-first RVQ training done. Model saved to {model_path}")
 
 
 if __name__ == "__main__":
