@@ -11,6 +11,12 @@ import torch
 
 from train_tfm import TrajRVQTransformer
 from train_tfm_accint import AccFirstRVQTokenizer
+from utils import (
+    build_scenario_masks,
+    compute_kinematic_profiles,
+    count_longitudinal_sign_changes,
+    resolve_default_data_path,
+)
 
 
 def load_trajs(data_path: str) -> np.ndarray:
@@ -55,96 +61,24 @@ def denormalize_trajs(x_norm: torch.Tensor, mean: torch.Tensor, std: torch.Tenso
     return x_norm * scale_factor * (std + 1e-8) + mean
 
 
-def compute_motion_features(all_dxdydyaw_clips: np.ndarray, fps: float = 5.0, time_duration=None):
-    clips = np.asarray(all_dxdydyaw_clips)
-    n, t, _ = clips.shape
-    dxs = clips[:, :, 0]
-    dys = clips[:, :, 1]
-    dyaws = clips[:, :, 2]
-
-    cumulative_yaws = np.cumsum(dyaws, axis=1)
-    prev_yaws = np.zeros((n, t), dtype=dxs.dtype)
-    prev_yaws[:, 1:] = cumulative_yaws[:, :-1]
-
-    net_yaw = cumulative_yaws[:, -1] if t > 0 else np.zeros(n, dtype=np.float32)
-    gross_yaw = np.sum(np.abs(dyaws), axis=1)
-
-    cos_y = np.cos(prev_yaws)
-    sin_y = np.sin(prev_yaws)
-    dx_g = cos_y * dxs - sin_y * dys
-    dy_g = sin_y * dxs + cos_y * dys
-
-    step_d = np.sqrt(dx_g**2 + dy_g**2)
-    total_dist = np.sum(step_d, axis=1)
-
-    duration = time_duration if time_duration is not None else (t / fps)
-    duration = max(float(duration), 1e-6)
-    avg_speed = total_dist / duration
-
-    s = np.sign(dyaws)
-    s[s == 0] = 1
-    sign_changes = np.sum(s[:, 1:] != s[:, :-1], axis=1)
-
-    return {
-        "net_yaw": net_yaw,
-        "gross_yaw": gross_yaw,
-        "total_dist": total_dist,
-        "avg_speed": avg_speed,
-        "sign_changes": sign_changes,
-    }
-
-
-def build_scenario_masks(all_trajs: np.ndarray, fps: float = 5.0) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-    feat = compute_motion_features(all_trajs, fps=fps)
-
-    net_yaw = feat["net_yaw"]
-    gross_yaw = feat["gross_yaw"]
-    total_dist = feat["total_dist"]
-    avg_speed = feat["avg_speed"]
-    sign_changes = feat["sign_changes"]
-
-    th_dist_static = 1.0
-    th_straight_net = 0.10
-    th_straight_gross = 0.20
-    v_10 = 10.0 / 3.6
-    v_80 = 80.0 / 3.6
-    v_120 = 120.0 / 3.6
-    th_turn = 0.35
-    th_uturn = 2.35
-
-    mask_static = total_dist < th_dist_static
-    mask_straight = (np.abs(net_yaw) < th_straight_net) & (gross_yaw < th_straight_gross) & (~mask_static)
-    mask_low_straight = mask_straight & (avg_speed >= (v_10 - 2 / 3.6)) & (avg_speed <= (v_10 + 2 / 3.6))
-    mask_high_straight = mask_straight & (avg_speed >= (v_80 - 10 / 3.6)) & (avg_speed <= (v_80 + 10 / 3.6))
-    mask_high_straight_120 = mask_straight & (avg_speed >= (v_120 - 15 / 3.6)) & (avg_speed <= (v_120 + 15 / 3.6))
-    mask_left = (net_yaw >= th_turn) & (np.abs(net_yaw) < th_uturn) & (~mask_static)
-    mask_right = (net_yaw <= -th_turn) & (np.abs(net_yaw) < th_uturn) & (~mask_static)
-    mask_detour = (np.abs(net_yaw) < 0.20) & (gross_yaw >= 0.80) & (sign_changes >= 2) & (~mask_static)
-    mask_uturn = (np.abs(net_yaw) >= th_uturn) & (~mask_static)
-
-    categories = {
-        "Stationary": mask_static,
-        "LowSpeedStraight_10kmh": mask_low_straight,
-        "HighSpeedStraight_80kmh": mask_high_straight,
-        "HighSpeedStraight_120kmh": mask_high_straight_120,
-        "LeftTurn": mask_left,
-        "RightTurn": mask_right,
-        "Detour": mask_detour,
-        "UTurn": mask_uturn,
-    }
-    return categories, feat
-
-
 def select_representative_indices(categories: Dict[str, np.ndarray], feat: Dict[str, np.ndarray]) -> Dict[str, Dict]:
     net_yaw = feat["net_yaw"]
     gross_yaw = feat["gross_yaw"]
     total_dist = feat["total_dist"]
     avg_speed = feat["avg_speed"]
     sign_changes = feat["sign_changes"]
+    reverse_ratio = feat.get("reverse_ratio", np.zeros_like(avg_speed))
+    reverse_dist = feat.get("reverse_dist", np.zeros_like(avg_speed))
+    reverse_steps = feat.get("reverse_steps", np.zeros_like(sign_changes))
+    stop_ratio = feat.get("stop_ratio", np.zeros_like(avg_speed))
+    long_vel_sign_changes = feat.get("long_vel_sign_changes", np.zeros_like(sign_changes))
+    avg_abs_curvature = feat.get("avg_abs_curvature", np.zeros_like(avg_speed))
+    max_abs_curvature = feat.get("max_abs_curvature", np.zeros_like(avg_speed))
 
     v_10 = 10.0 / 3.6
     v_80 = 80.0 / 3.6
     v_120 = 120.0 / 3.6
+    target_uturn_speed = 6.0
 
     out = {}
     for name, mask in categories.items():
@@ -167,8 +101,16 @@ def select_representative_indices(categories: Dict[str, np.ndarray], feat: Dict[
             score = np.abs(net_yaw[idxs] + 1.0) + 0.05 * np.abs(avg_speed[idxs] - v_10)
         elif name == "Detour":
             score = np.abs(net_yaw[idxs]) + (1.0 / (gross_yaw[idxs] + 1e-6)) + (1.0 / (sign_changes[idxs] + 1e-6))
-        elif name == "UTurn":
-            score = np.abs(np.abs(net_yaw[idxs]) - np.pi)
+        elif name == "Reverse":
+            score = (
+                -reverse_dist[idxs]
+                - 2.0 * reverse_ratio[idxs]
+                - 0.5 * long_vel_sign_changes[idxs]
+                - 0.2 * gross_yaw[idxs]
+                + 0.1 * avg_speed[idxs]
+            )
+        elif name == "DirectUTurn":
+            score = np.abs(np.abs(net_yaw[idxs]) - np.pi) + 0.05 * np.abs(avg_speed[idxs] - target_uturn_speed)
         else:
             score = np.zeros(len(idxs))
 
@@ -183,6 +125,13 @@ def select_representative_indices(categories: Dict[str, np.ndarray], feat: Dict[
                 "avg_speed_mps": float(avg_speed[best_idx]),
                 "avg_speed_kmh": float(avg_speed[best_idx] * 3.6),
                 "sign_changes": int(sign_changes[best_idx]),
+                "reverse_ratio": float(reverse_ratio[best_idx]),
+                "reverse_dist": float(reverse_dist[best_idx]),
+                "reverse_steps": int(reverse_steps[best_idx]),
+                "stop_ratio": float(stop_ratio[best_idx]),
+                "long_vel_sign_changes": int(long_vel_sign_changes[best_idx]),
+                "avg_abs_curvature": float(avg_abs_curvature[best_idx]),
+                "max_abs_curvature": float(max_abs_curvature[best_idx]),
             },
         }
     return out
@@ -195,14 +144,23 @@ def select_velocity_acc_variation_indices(
     num_samples: int,
     exclude_indices: Dict[str, Dict],
 ) -> Dict[str, List[Dict]]:
-    speed, acc = compute_speed_and_acc(trajs, dt)
+    profiles = compute_kinematic_profiles(trajs, dt)
+    speed = profiles["speed"]
+    acc = profiles["acc"]
+    curvature = profiles["curvature"]
+    local_vx = profiles["local_vx"]
+
     speed_std = np.std(speed, axis=1)
-    if acc.shape[1] > 0:
-        acc_std = np.std(acc, axis=1)
-        acc_abs_mean = np.mean(np.abs(acc), axis=1)
-    else:
-        acc_std = np.zeros(len(trajs), dtype=np.float32)
-        acc_abs_mean = np.zeros(len(trajs), dtype=np.float32)
+    acc_std = np.std(acc, axis=1)
+    acc_abs_mean = np.mean(np.abs(acc), axis=1)
+    curvature_std = np.std(curvature, axis=1)
+    curvature_abs_mean = np.mean(np.abs(curvature), axis=1)
+
+    reverse_mask = local_vx < -0.2
+    reverse_ratio = reverse_mask.mean(axis=1)
+    reverse_dist = np.sum(np.abs(local_vx) * dt * reverse_mask, axis=1)
+    stop_ratio = (speed < 0.3).mean(axis=1)
+    long_vel_sign_changes = count_longitudinal_sign_changes(local_vx, speed_th=0.2)
 
     out = {}
     for scenario_name, mask in categories.items():
@@ -221,11 +179,28 @@ def select_velocity_acc_variation_indices(
         scenario_speed_std = speed_std[idxs]
         scenario_acc_std = acc_std[idxs]
         scenario_acc_abs_mean = acc_abs_mean[idxs]
-        score = (
-            scenario_speed_std / (scenario_speed_std.max() + 1e-6)
-            + scenario_acc_std / (scenario_acc_std.max() + 1e-6)
-            + scenario_acc_abs_mean / (scenario_acc_abs_mean.max() + 1e-6)
-        )
+        scenario_curvature_std = curvature_std[idxs]
+        scenario_curvature_abs_mean = curvature_abs_mean[idxs]
+        scenario_reverse_ratio = reverse_ratio[idxs]
+        scenario_reverse_dist = reverse_dist[idxs]
+        scenario_stop_ratio = stop_ratio[idxs]
+        scenario_long_sign_changes = long_vel_sign_changes[idxs]
+
+        if scenario_name == "Reverse":
+            score = (
+                scenario_reverse_dist / (scenario_reverse_dist.max() + 1e-6)
+                + scenario_reverse_ratio / (scenario_reverse_ratio.max() + 1e-6)
+                + scenario_long_sign_changes / (scenario_long_sign_changes.max() + 1e-6)
+                + scenario_stop_ratio / (scenario_stop_ratio.max() + 1e-6)
+                + scenario_curvature_abs_mean / (scenario_curvature_abs_mean.max() + 1e-6)
+            )
+        else:
+            score = (
+                scenario_speed_std / (scenario_speed_std.max() + 1e-6)
+                + scenario_acc_std / (scenario_acc_std.max() + 1e-6)
+                + scenario_acc_abs_mean / (scenario_acc_abs_mean.max() + 1e-6)
+                + scenario_curvature_abs_mean / (scenario_curvature_abs_mean.max() + 1e-6)
+            )
 
         order = np.argsort(-score)[:num_samples]
         out[scenario_name] = [
@@ -235,34 +210,17 @@ def select_velocity_acc_variation_indices(
                     "speed_std_mps": float(speed_std[idxs[i]]),
                     "acc_std_mps2": float(acc_std[idxs[i]]),
                     "acc_abs_mean_mps2": float(acc_abs_mean[idxs[i]]),
+                    "curvature_std_1pm": float(curvature_std[idxs[i]]),
+                    "curvature_abs_mean_1pm": float(curvature_abs_mean[idxs[i]]),
+                    "reverse_ratio": float(reverse_ratio[idxs[i]]),
+                    "reverse_dist_m": float(reverse_dist[idxs[i]]),
+                    "stop_ratio": float(stop_ratio[idxs[i]]),
+                    "long_vel_sign_changes": int(long_vel_sign_changes[idxs[i]]),
                 },
             }
             for i in order
         ]
     return out
-
-
-def integrate_to_global(trajs: np.ndarray) -> np.ndarray:
-    dx = trajs[:, :, 0]
-    dy = trajs[:, :, 1]
-    dyaw = trajs[:, :, 2]
-    yaw = np.cumsum(dyaw, axis=1)
-    prev_yaw = np.zeros_like(yaw)
-    prev_yaw[:, 1:] = yaw[:, :-1]
-
-    dx_global = dx * np.cos(prev_yaw) - dy * np.sin(prev_yaw)
-    dy_global = dx * np.sin(prev_yaw) + dy * np.cos(prev_yaw)
-
-    x_global = np.cumsum(dx_global, axis=1)
-    y_global = np.cumsum(dy_global, axis=1)
-    return np.stack([x_global, y_global], axis=-1)
-
-
-def compute_speed_and_acc(trajs: np.ndarray, dt: float) -> Tuple[np.ndarray, np.ndarray]:
-    speed = np.sqrt(trajs[:, :, 0] ** 2 + trajs[:, :, 1] ** 2) / dt
-    acc = np.diff(speed, axis=1) / dt
-    return speed, acc
-
 
 ModelUnion = Union[TrajRVQTransformer, AccFirstRVQTokenizer]
 
@@ -293,14 +251,30 @@ def reconstruct_trajs(
 
 
 def scenario_metrics(gt_trajs: np.ndarray, pred_trajs: np.ndarray, dt: float) -> Dict[str, float]:
-    gt_xy = integrate_to_global(gt_trajs)
-    pred_xy = integrate_to_global(pred_trajs)
-    step_dist_error = np.sqrt(np.sum((pred_xy - gt_xy) ** 2, axis=-1))
+    gt_prof = compute_kinematic_profiles(gt_trajs, dt)
+    pred_prof = compute_kinematic_profiles(pred_trajs, dt)
 
-    gt_speed, pred_acc_gt = compute_speed_and_acc(gt_trajs, dt)
-    pred_speed, pred_acc = compute_speed_and_acc(pred_trajs, dt)
-    speed_err = pred_speed - gt_speed
-    acc_err = pred_acc - pred_acc_gt
+    step_dist_error = np.sqrt(np.sum((pred_prof["xy"] - gt_prof["xy"]) ** 2, axis=-1) + 1e-6)
+
+    speed_err = pred_prof["speed"] - gt_prof["speed"]
+    acc_err = pred_prof["acc"] - gt_prof["acc"]
+    vx_err = pred_prof["vx"] - gt_prof["vx"]
+    vy_err = pred_prof["vy"] - gt_prof["vy"]
+    ax_err = pred_prof["ax"] - gt_prof["ax"]
+    ay_err = pred_prof["ay"] - gt_prof["ay"]
+
+    curvature_err = pred_prof["curvature"] - gt_prof["curvature"]
+    valid_curvature = (gt_prof["speed"] > 0.3) & (pred_prof["speed"] > 0.3)
+    if np.any(valid_curvature):
+        curvature_mae = float(np.mean(np.abs(curvature_err[valid_curvature])))
+        curvature_rmse = float(np.sqrt(np.mean(curvature_err[valid_curvature] ** 2)))
+    else:
+        curvature_mae = 0.0
+        curvature_rmse = 0.0
+
+    reverse_mask = gt_prof["local_vx"] < -0.2
+    reverse_ratio = reverse_mask.mean(axis=1)
+    reverse_dist = np.sum(np.abs(gt_prof["local_vx"]) * dt * reverse_mask, axis=1)
 
     return {
         "count": int(len(gt_trajs)),
@@ -310,12 +284,22 @@ def scenario_metrics(gt_trajs: np.ndarray, pred_trajs: np.ndarray, dt: float) ->
         "vrr_1m": float((step_dist_error.max(axis=1) < 1.0).mean()),
         "speed_mae_mps": float(np.abs(speed_err).mean()),
         "speed_rmse_mps": float(np.sqrt(np.mean(speed_err ** 2))),
-        "gt_speed_mean_mps": float(gt_speed.mean()),
-        "pred_speed_mean_mps": float(pred_speed.mean()),
-        "acc_mae_mps2": float(np.abs(acc_err).mean()) if acc_err.size > 0 else 0.0,
-        "acc_rmse_mps2": float(np.sqrt(np.mean(acc_err ** 2))) if acc_err.size > 0 else 0.0,
-        "gt_acc_mean_mps2": float(pred_acc_gt.mean()) if pred_acc_gt.size > 0 else 0.0,
-        "pred_acc_mean_mps2": float(pred_acc.mean()) if pred_acc.size > 0 else 0.0,
+        "gt_speed_mean_mps": float(gt_prof["speed"].mean()),
+        "pred_speed_mean_mps": float(pred_prof["speed"].mean()),
+        "acc_mae_mps2": float(np.abs(acc_err).mean()),
+        "acc_rmse_mps2": float(np.sqrt(np.mean(acc_err ** 2))),
+        "gt_acc_mean_mps2": float(gt_prof["acc"].mean()),
+        "pred_acc_mean_mps2": float(pred_prof["acc"].mean()),
+        "vx_mae_mps": float(np.abs(vx_err).mean()),
+        "vy_mae_mps": float(np.abs(vy_err).mean()),
+        "ax_mae_mps2": float(np.abs(ax_err).mean()),
+        "ay_mae_mps2": float(np.abs(ay_err).mean()),
+        "curvature_mae_1pm": curvature_mae,
+        "curvature_rmse_1pm": curvature_rmse,
+        "gt_curvature_abs_mean_1pm": float(np.mean(np.abs(gt_prof["curvature"]))),
+        "pred_curvature_abs_mean_1pm": float(np.mean(np.abs(pred_prof["curvature"]))),
+        "reverse_ratio_mean": float(np.mean(reverse_ratio)),
+        "reverse_dist_mean_m": float(np.mean(reverse_dist)),
     }
 
 
@@ -324,13 +308,22 @@ def select_worst_reconstruction_indices(
     recon_trajs: np.ndarray,
     categories: Dict[str, np.ndarray],
     num_samples: int,
+    dt: float,
 ) -> Dict[str, List[Dict]]:
-    gt_xy = integrate_to_global(trajs)
-    pred_xy = integrate_to_global(recon_trajs)
-    step_dist_error = np.sqrt(np.sum((pred_xy - gt_xy) ** 2, axis=-1))
+    gt_prof = compute_kinematic_profiles(trajs, dt=dt)
+    pred_prof = compute_kinematic_profiles(recon_trajs, dt=dt)
+
+    step_dist_error = np.sqrt(np.sum((pred_prof["xy"] - gt_prof["xy"]) ** 2, axis=-1) + 1e-6)
     ade = step_dist_error.mean(axis=1)
     fde = step_dist_error[:, -1]
     max_error = step_dist_error.max(axis=1)
+    speed_mae = np.mean(np.abs(pred_prof["speed"] - gt_prof["speed"]), axis=1)
+    acc_mae = np.mean(np.abs(pred_prof["acc"] - gt_prof["acc"]), axis=1)
+
+    curvature_err = np.abs(pred_prof["curvature"] - gt_prof["curvature"])
+    curvature_valid = (gt_prof["speed"] > 0.3) & (pred_prof["speed"] > 0.3)
+    curvature_valid_counts = np.maximum(curvature_valid.sum(axis=1), 1)
+    curvature_mae = np.sum(curvature_err * curvature_valid, axis=1) / curvature_valid_counts
 
     out = {}
     for scenario_name, mask in categories.items():
@@ -347,6 +340,9 @@ def select_worst_reconstruction_indices(
                     "ade_m": float(ade[idxs[i]]),
                     "fde_m": float(fde[idxs[i]]),
                     "max_error_m": float(max_error[idxs[i]]),
+                    "speed_mae_mps": float(speed_mae[idxs[i]]),
+                    "acc_mae_mps2": float(acc_mae[idxs[i]]),
+                    "curvature_mae_1pm": float(curvature_mae[idxs[i]]),
                 },
             }
             for i in order
@@ -362,46 +358,100 @@ def plot_representative_case(
     dt: float,
     save_path: str,
 ):
-    gt_xy = integrate_to_global(gt_traj[None, ...])[0]
-    pred_xy = integrate_to_global(pred_traj[None, ...])[0]
-    gt_speed, gt_acc = compute_speed_and_acc(gt_traj[None, ...], dt)
-    pred_speed, pred_acc = compute_speed_and_acc(pred_traj[None, ...], dt)
+    gt_prof = compute_kinematic_profiles(gt_traj[None, ...], dt)
+    pred_prof = compute_kinematic_profiles(pred_traj[None, ...], dt)
 
+    gt_xy = gt_prof["xy"][0]
+    pred_xy = pred_prof["xy"][0]
     t = np.arange(gt_traj.shape[0]) * dt
-    t_acc = np.arange(max(gt_traj.shape[0] - 1, 0)) * dt
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(2, 4, figsize=(24, 10))
+    ax_traj = axes[0, 0]
+    ax_vx = axes[0, 1]
+    ax_vy = axes[0, 2]
+    ax_v = axes[0, 3]
+    ax_curv = axes[1, 0]
+    ax_ax = axes[1, 1]
+    ax_ay = axes[1, 2]
+    ax_a = axes[1, 3]
 
-    axes[0].plot(gt_xy[:, 0], gt_xy[:, 1], label="GT", linewidth=2)
-    axes[0].plot(pred_xy[:, 0], pred_xy[:, 1], label="Recon", linewidth=2, linestyle="--")
-    axes[0].scatter(gt_xy[0, 0], gt_xy[0, 1], c="green", s=40, label="Start")
-    axes[0].scatter(gt_xy[-1, 0], gt_xy[-1, 1], c="red", s=40, label="GT End")
-    axes[0].scatter(pred_xy[-1, 0], pred_xy[-1, 1], c="orange", s=40, label="Recon End")
-    axes[0].set_title(f"{scenario_name} Trajectory")
-    axes[0].set_xlabel("X (m)")
-    axes[0].set_ylabel("Y (m)")
-    axes[0].axis("equal")
-    axes[0].grid(True, alpha=0.3)
-    axes[0].legend()
+    ax_traj.plot(gt_xy[:, 0], gt_xy[:, 1], label="GT", linewidth=2)
+    ax_traj.plot(pred_xy[:, 0], pred_xy[:, 1], label="Recon", linewidth=2, linestyle="--")
+    ax_traj.scatter(gt_xy[0, 0], gt_xy[0, 1], c="green", s=40, label="Start")
+    ax_traj.scatter(gt_xy[-1, 0], gt_xy[-1, 1], c="red", s=40, label="GT End")
+    ax_traj.scatter(pred_xy[-1, 0], pred_xy[-1, 1], c="orange", s=40, label="Recon End")
+    ax_traj.set_title(f"{scenario_name} Trajectory")
+    ax_traj.set_xlabel("X (m)")
+    ax_traj.set_ylabel("Y (m)")
+    ax_traj.axis("equal")
+    ax_traj.grid(True, alpha=0.3)
+    ax_traj.legend(fontsize=8)
 
-    axes[1].plot(t, gt_speed[0], label="GT vel", linewidth=2)
-    axes[1].plot(t, pred_speed[0], label="Recon vel", linewidth=2, linestyle="--")
-    axes[1].set_title("Velocity")
-    axes[1].set_xlabel("Time (s)")
-    axes[1].set_ylabel("Speed (m/s)")
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend()
+    ax_vx.plot(t, gt_prof["vx"][0], label="GT vx", linewidth=2.0)
+    ax_vx.plot(t, pred_prof["vx"][0], label="Recon vx", linewidth=2.0, linestyle="--")
+    ax_vx.axhline(0.0, color="gray", linewidth=1.0, alpha=0.6)
+    ax_vx.set_title("vx")
+    ax_vx.set_xlabel("Time (s)")
+    ax_vx.set_ylabel("Velocity (m/s)")
+    ax_vx.grid(True, alpha=0.3)
+    ax_vx.legend(fontsize=8)
 
-    axes[2].plot(t_acc, gt_acc[0], label="GT acc", linewidth=2)
-    axes[2].plot(t_acc, pred_acc[0], label="Recon acc", linewidth=2, linestyle="--")
-    axes[2].set_title("Acceleration")
-    axes[2].set_xlabel("Time (s)")
-    axes[2].set_ylabel("Acceleration (m/s^2)")
-    axes[2].grid(True, alpha=0.3)
-    axes[2].legend()
+    ax_vy.plot(t, gt_prof["vy"][0], label="GT vy", linewidth=2.0)
+    ax_vy.plot(t, pred_prof["vy"][0], label="Recon vy", linewidth=2.0, linestyle="--")
+    ax_vy.axhline(0.0, color="gray", linewidth=1.0, alpha=0.6)
+    ax_vy.set_title("vy")
+    ax_vy.set_xlabel("Time (s)")
+    ax_vy.set_ylabel("Velocity (m/s)")
+    ax_vy.grid(True, alpha=0.3)
+    ax_vy.legend(fontsize=8)
+
+    ax_v.plot(t, gt_prof["speed"][0], label="GT |v|", linewidth=2.0)
+    ax_v.plot(t, pred_prof["speed"][0], label="Recon |v|", linewidth=2.0, linestyle="--")
+    ax_v.axhline(0.0, color="gray", linewidth=1.0, alpha=0.6)
+    ax_v.set_title("v")
+    ax_v.set_xlabel("Time (s)")
+    ax_v.set_ylabel("Speed (m/s)")
+    ax_v.grid(True, alpha=0.3)
+    ax_v.legend(fontsize=8)
+
+    ax_curv.plot(t, gt_prof["curvature"][0], label="GT curvature", linewidth=2.0)
+    ax_curv.plot(t, pred_prof["curvature"][0], label="Recon curvature", linewidth=2.0, linestyle="--")
+    ax_curv.axhline(0.0, color="gray", linewidth=1.0, alpha=0.6)
+    ax_curv.set_title("Signed Curvature")
+    ax_curv.set_xlabel("Time (s)")
+    ax_curv.set_ylabel("Curvature (1/m)")
+    ax_curv.grid(True, alpha=0.3)
+    ax_curv.legend(fontsize=8)
+
+    ax_ax.plot(t, gt_prof["ax"][0], label="GT ax", linewidth=2.0)
+    ax_ax.plot(t, pred_prof["ax"][0], label="Recon ax", linewidth=2.0, linestyle="--")
+    ax_ax.axhline(0.0, color="gray", linewidth=1.0, alpha=0.6)
+    ax_ax.set_title("ax")
+    ax_ax.set_xlabel("Time (s)")
+    ax_ax.set_ylabel("Acceleration (m/s^2)")
+    ax_ax.grid(True, alpha=0.3)
+    ax_ax.legend(fontsize=8)
+
+    ax_ay.plot(t, gt_prof["ay"][0], label="GT ay", linewidth=2.0)
+    ax_ay.plot(t, pred_prof["ay"][0], label="Recon ay", linewidth=2.0, linestyle="--")
+    ax_ay.axhline(0.0, color="gray", linewidth=1.0, alpha=0.6)
+    ax_ay.set_title("ay")
+    ax_ay.set_xlabel("Time (s)")
+    ax_ay.set_ylabel("Acceleration (m/s^2)")
+    ax_ay.grid(True, alpha=0.3)
+    ax_ay.legend(fontsize=8)
+
+    ax_a.plot(t, gt_prof["acc"][0], label="GT |a|", linewidth=2.0)
+    ax_a.plot(t, pred_prof["acc"][0], label="Recon |a|", linewidth=2.0, linestyle="--")
+    ax_a.axhline(0.0, color="gray", linewidth=1.0, alpha=0.6)
+    ax_a.set_title("a")
+    ax_a.set_xlabel("Time (s)")
+    ax_a.set_ylabel("Acceleration (m/s^2)")
+    ax_a.grid(True, alpha=0.3)
+    ax_a.legend(fontsize=8)
 
     fig.suptitle(f"{scenario_name} | sample_idx={sample_idx}")
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(save_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -410,7 +460,7 @@ def infer_model_type(model_path: str, model_type: str) -> str:
     if model_type != "auto":
         return model_type
     basename = os.path.basename(model_path)
-    if "accint" in basename:
+    if ("accint" in basename) or ("accfirst" in basename):
         return "accint"
     return "taae"
 
@@ -462,7 +512,7 @@ def save_summary_csv(metrics_by_scenario: Dict[str, Dict[str, float]], csv_path:
 
 def main():
     parser = argparse.ArgumentParser(description="Scenario-wise tokenizer evaluation for kinematic RVQ transformer.")
-    parser.add_argument("--data-path", type=str, default="/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy")
+    parser.add_argument("--data-path", type=str, default=resolve_default_data_path())
     parser.add_argument("--save-dir", type=str, default="./work_dirs/tokenizer/rvq_tfm_kin_0311")
     parser.add_argument("--model-path", type=str, default=None)
     parser.add_argument("--model-type", type=str, default="auto", choices=["auto", "taae", "accint"])
@@ -524,7 +574,12 @@ def main():
         recon_trajs=recon_trajs,
         categories=categories,
         num_samples=args.num_worst_plots,
+        dt=args.dt,
     )
+
+    total_samples = max(int(len(trajs)), 1)
+    scenario_counts = {name: int(mask.sum()) for name, mask in categories.items()}
+    scenario_ratios = {name: float(count / total_samples) for name, count in scenario_counts.items()}
 
     metrics_by_scenario = {}
     for scenario_name, mask in categories.items():
@@ -534,25 +589,27 @@ def main():
             continue
 
         metrics = scenario_metrics(trajs[idxs], recon_trajs[idxs], dt=args.dt)
+        rep_idx = representatives[scenario_name]["idx"]
+        rep_info = representatives[scenario_name]["info"]
         metrics.update(
             {
-                "rep_idx": int(representatives[scenario_name]["idx"]),
-                "rep_avg_speed_kmh": float(representatives[scenario_name]["info"]["avg_speed_kmh"]),
-                "rep_total_dist_m": float(representatives[scenario_name]["info"]["total_dist"]),
-                "rep_net_yaw_rad": float(representatives[scenario_name]["info"]["net_yaw"]),
+                "rep_idx": int(rep_idx) if rep_idx is not None else -1,
+                "rep_avg_speed_kmh": float(rep_info.get("avg_speed_kmh", 0.0)),
+                "rep_total_dist_m": float(rep_info.get("total_dist", 0.0)),
+                "rep_net_yaw_rad": float(rep_info.get("net_yaw", 0.0)),
             }
         )
         metrics_by_scenario[scenario_name] = metrics
 
-        rep_idx = representatives[scenario_name]["idx"]
-        plot_representative_case(
-            scenario_name=scenario_name,
-            sample_idx=rep_idx,
-            gt_traj=trajs[rep_idx],
-            pred_traj=recon_trajs[rep_idx],
-            dt=args.dt,
-            save_path=os.path.join(output_dir, f"{scenario_name}_classic.png"),
-        )
+        if rep_idx is not None:
+            plot_representative_case(
+                scenario_name=scenario_name,
+                sample_idx=rep_idx,
+                gt_traj=trajs[rep_idx],
+                pred_traj=recon_trajs[rep_idx],
+                dt=args.dt,
+                save_path=os.path.join(output_dir, f"{scenario_name}_classic.png"),
+            )
         for plot_id, item in enumerate(variation_representatives[scenario_name], start=1):
             var_idx = item["idx"]
             plot_representative_case(
@@ -594,6 +651,8 @@ def main():
         "representatives": representatives,
         "variation_representatives": variation_representatives,
         "worst_representatives": worst_representatives,
+        "scenario_counts": scenario_counts,
+        "scenario_ratios": scenario_ratios,
         "token_shape": list(codes.shape),
     }
 
@@ -607,6 +666,11 @@ def main():
     print("Overall Metrics")
     for key, value in overall_metrics.items():
         print(f"{key}: {value}")
+    print("=" * 80)
+    print("Scenario Counts")
+    for scenario_name, count in scenario_counts.items():
+        ratio = scenario_ratios[scenario_name]
+        print(f"{scenario_name}: count={count}, ratio={ratio:.4f}")
     print("=" * 80)
     print("Scenario Metrics")
     for scenario_name, metrics in metrics_by_scenario.items():
@@ -623,13 +687,14 @@ if __name__ == "__main__":
     main()
 
 # python eval_tokenizer_by_scenario.py \
-#   --data-path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.npy \
+#   --data-path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas_augmented_reverse_detour_directuturn_hs120.npy \
 #   --save-dir ./work_dirs/tokenizer/rvq_tfm_kin_0311 \
 #   --data-type pred \
 #   --num-var-plots 5 \
 #   --model-type taae
 
 # python eval_tokenizer_by_scenario.py \
+#   --data-path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas_augmented_reverse_detour_directuturn_hs120.npy \
 #   --save-dir ./work_dirs/tokenizer/rvq_tfm_accint_0423 \
 #   --model-path ./work_dirs/tokenizer/rvq_tfm_accint_0423/pred_rvq_accint_model.pth \
 #   --model-type accint \
