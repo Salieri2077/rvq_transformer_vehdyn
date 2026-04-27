@@ -20,14 +20,14 @@ from utils import (
 # from tokenizer.rvq.rvq_mlp.train import integrate_trajectory_keyframe_torch
 
 
-def velocity_loss_from_dxdydyaw(pred_u: torch.Tensor, gt_u: torch.Tensor, dt: float = 0.1):
+def signed_velocity_loss_from_dxdydyaw(pred_u: torch.Tensor, gt_u: torch.Tensor, dt: float = 0.1):
     """
-    基于 dxdydyaw 计算速度并施加约束（Batch 版本）。
+    基于 dxdydyaw 计算带符号速度并施加约束（Batch 版本）。
 
     思路：
       - dxdydyaw 中的 dx, dy 表示相对于上一帧 ego 坐标系的位移增量
-      - 速度标量可以近似为 v = sqrt(dx^2 + dy^2) / dt
-        （只与位移长度有关，不依赖全局坐标系旋转）
+      - vx = dx / dt 保留符号，dx < 0 表示倒车
+      - vy = dy / dt 表示横向速度
 
     Args:
         pred_u: [B, T, 3] - 预测的 dxdydyaw
@@ -35,47 +35,41 @@ def velocity_loss_from_dxdydyaw(pred_u: torch.Tensor, gt_u: torch.Tensor, dt: fl
         dt:     时间步长（秒），只影响速度的绝对数值，损失相对权重可通过 loss weight 调整
 
     Returns:
-        标量 velocity_loss：预测速度与 GT 速度的 MSE 误差
+        标量 velocity_loss：预测/GT 带符号速度的 MSE 误差
     """
     assert pred_u.shape == gt_u.shape
     assert pred_u.shape[-1] == 3
 
-    dx_pred = pred_u[:, :, 0]
-    dy_pred = pred_u[:, :, 1]
-    dx_gt = gt_u[:, :, 0]
-    dy_gt = gt_u[:, :, 1]
+    vx_pred = pred_u[:, :, 0] / dt
+    vy_pred = pred_u[:, :, 1] / dt
+    vx_gt = gt_u[:, :, 0] / dt
+    vy_gt = gt_u[:, :, 1] / dt
 
-    eps = 1e-6
-    v_pred = torch.sqrt(dx_pred * dx_pred + dy_pred * dy_pred + eps) / dt
-    v_gt = torch.sqrt(dx_gt * dx_gt + dy_gt * dy_gt + eps) / dt
-
-    return F.mse_loss(v_pred, v_gt)
+    return F.mse_loss(vx_pred, vx_gt) + 0.2 * F.mse_loss(vy_pred, vy_gt)
 
 
-def acceleration_loss_from_dxdydyaw(pred_u: torch.Tensor, gt_u: torch.Tensor, dt: float = 0.1):
+def signed_acceleration_loss_from_dxdydyaw(pred_u: torch.Tensor, gt_u: torch.Tensor, dt: float = 0.1):
     """
-    基于 dxdydyaw 计算加速度并施加约束（Batch 版本）。
+    基于 dxdydyaw 计算带符号加速度并施加约束（Batch 版本）。
 
     思路：
-      - 先由 dx, dy 计算速度标量
-      - 再对速度做一阶差分得到加速度
+      - 先由 dx, dy 计算带符号的 vx / vy
+      - 再对 vx / vy 做一阶差分得到 ax / ay
     """
     assert pred_u.shape == gt_u.shape
     assert pred_u.shape[-1] == 3
 
-    dx_pred = pred_u[:, :, 0]
-    dy_pred = pred_u[:, :, 1]
-    dx_gt = gt_u[:, :, 0]
-    dy_gt = gt_u[:, :, 1]
+    vx_pred = pred_u[:, :, 0] / dt
+    vx_gt = gt_u[:, :, 0] / dt
+    vy_pred = pred_u[:, :, 1] / dt
+    vy_gt = gt_u[:, :, 1] / dt
 
-    eps = 1e-6
-    v_pred = torch.sqrt(dx_pred * dx_pred + dy_pred * dy_pred + eps) / dt
-    v_gt = torch.sqrt(dx_gt * dx_gt + dy_gt * dy_gt + eps) / dt
+    ax_pred = (vx_pred[:, 1:] - vx_pred[:, :-1]) / dt
+    ax_gt = (vx_gt[:, 1:] - vx_gt[:, :-1]) / dt
+    ay_pred = (vy_pred[:, 1:] - vy_pred[:, :-1]) / dt
+    ay_gt = (vy_gt[:, 1:] - vy_gt[:, :-1]) / dt
 
-    a_pred = (v_pred[:, 1:] - v_pred[:, :-1]) / dt
-    a_gt = (v_gt[:, 1:] - v_gt[:, :-1]) / dt
-
-    return F.mse_loss(a_pred, a_gt)
+    return F.mse_loss(ax_pred, ax_gt) + 0.2 * F.mse_loss(ay_pred, ay_gt)
 
 
 def integrate_to_global_torch(trajs: torch.Tensor) -> torch.Tensor:
@@ -277,10 +271,10 @@ class TrajRVQTransformer(nn.Module):
             h_dec: [B, D] - transformer decoder 输出
         Returns:
             x_norm:  [B, T, 3] - 归一化空间的 dxdydyaw
-            v:       [B, T]    - 速度 profile (m/s)，用于外部 smoothness loss
+            v:       [B, T]    - 带符号的纵向速度 profile (m/s)，允许为负，表示倒车
             kappa:   [B, T]    - 曲率 profile (1/m)，用于外部 smoothness loss
         """
-        v = F.softplus(self.v_head(h_dec))                      # [B, T] 速度，非负
+        v = 40.0 * torch.tanh(self.v_head(h_dec) / 40.0)       # [B, T] 带符号纵向速度，限幅避免速度爆炸
         kappa = torch.tanh(self.kappa_head(h_dec)) * 0.5        # [B, T] 曲率，[-0.5, 0.5] 1/m
         dy_phys = self.dy_head(h_dec) * 0.01                    # [B, T] 横向，量级 ~mm
 
@@ -513,8 +507,8 @@ def train_rvq_taae(
                 # Loss 2: 真实动态监督
                 pred_phys_for_loss = (x_recon * model.norm_scale * model.norm_std) + model.norm_mean
                 gt_phys_for_loss = (x * model.norm_scale * model.norm_std) + model.norm_mean
-                vel_loss = velocity_loss_from_dxdydyaw(pred_phys_for_loss, gt_phys_for_loss, dt=model.dt)
-                acc_loss = acceleration_loss_from_dxdydyaw(pred_phys_for_loss, gt_phys_for_loss, dt=model.dt)
+                vel_loss = signed_velocity_loss_from_dxdydyaw(pred_phys_for_loss, gt_phys_for_loss, dt=model.dt)
+                acc_loss = signed_acceleration_loss_from_dxdydyaw(pred_phys_for_loss, gt_phys_for_loss, dt=model.dt)
 
                 pred_phys_for_loss = (x_recon * model.norm_scale * model.norm_std) + model.norm_mean
                 gt_phys_for_loss = (x * model.norm_scale * model.norm_std) + model.norm_mean
@@ -525,8 +519,8 @@ def train_rvq_taae(
                 )
 
                 # Loss 3: 运动学参数平滑性（直接约束物理量，比频域 smoothness 更直观）
-                # v 的差分 ≈ 加速度，kappa 的差分 ≈ 曲率变化率（方向盘转速）
-                acc = (v[:, 1:] - v[:, :-1]) / model.dt          # [B, T-1] 加速度 (m/s²)
+                # signed v 的差分 ≈ 纵向加速度，kappa 的差分 ≈ 曲率变化率（方向盘转速）
+                acc = (v[:, 1:] - v[:, :-1]) / model.dt          # [B, T-1] 带符号纵向加速度 (m/s²)
                 kappa_rate = (kappa[:, 1:] - kappa[:, :-1]) / model.dt  # [B, T-1] 曲率变化率
                 kin_smooth_loss = acc.pow(2).mean() + kappa_rate.pow(2).mean()
                 ### 上述不太对，应该再求一次导数，约束acc和kappa_rate ###
@@ -655,14 +649,17 @@ def train_rvq_taae(
             # 打印 v/kappa 的统计信息，方便调试
             with torch.no_grad():
                 v_mean = v.mean().item()
+                v_min = v.min().item()
                 v_max = v.max().item()
+                v_abs_mean = v.abs().mean().item()
                 kappa_abs_mean = kappa.abs().mean().item()
             print(
                 f"[KinRVQ] Epoch {epoch+1:03d} | Recon: {avg_recon:.5f} | "
                 f"VQ: {avg_vq:.5f} | Vel: {avg_vel:.5f} | Acc: {avg_acc:.5f} | KinSmooth: {avg_kin:.5f} | "
                 f"TurnGlobal: {avg_turn_global:.5f} | TurnYaw: {avg_turn_yaw:.5f} | TurnRatio: {turn_ratio:.3f} | "
                 f"TrajErr: {avg_traj:.4f} m | EndErr: {avg_endpoint:.4f} m | VRR: {vrr:.4f} | "
-                f"v_mean: {v_mean:.2f} m/s | v_max: {v_max:.2f} | κ_abs: {kappa_abs_mean:.4f}"
+                f"v_mean: {v_mean:.2f} m/s | v_min: {v_min:.2f} | v_max: {v_max:.2f} | "
+                f"v_abs_mean: {v_abs_mean:.2f} | κ_abs: {kappa_abs_mean:.4f}"
             )
 
     # 5. 保存模型

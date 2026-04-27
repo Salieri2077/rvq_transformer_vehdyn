@@ -82,15 +82,13 @@ def compute_dynamics_from_dxdydyaw(dxdydyaw: torch.Tensor, dt: float):
     yaw_rate = dyaw / (dt + 1e-8)
     w0 = yaw_rate[:, 0]
 
+    # 约定：acc[0] 不作为可观测差分加速度（固定为 0），
+    # 只从 t>=1 监督/使用 acc[t] = (vel[t]-vel[t-1])/dt
+    acc_xy = torch.zeros_like(vel_xy)
+    acc_yaw = torch.zeros_like(yaw_rate)
     if dxdydyaw.shape[1] > 1:
-        raw_acc_xy = (vel_xy[:, 1:, :] - vel_xy[:, :-1, :]) / (dt + 1e-8)
-        acc_xy = torch.cat([raw_acc_xy[:, :1, :], raw_acc_xy], dim=1)
-
-        raw_acc_yaw = (yaw_rate[:, 1:] - yaw_rate[:, :-1]) / (dt + 1e-8)
-        acc_yaw = torch.cat([raw_acc_yaw[:, :1], raw_acc_yaw], dim=1)
-    else:
-        acc_xy = torch.zeros_like(vel_xy)
-        acc_yaw = torch.zeros_like(yaw_rate)
+        acc_xy[:, 1:, :] = (vel_xy[:, 1:, :] - vel_xy[:, :-1, :]) / (dt + 1e-8)
+        acc_yaw[:, 1:] = (yaw_rate[:, 1:] - yaw_rate[:, :-1]) / (dt + 1e-8)
 
     return {
         "pos_xy_global": pos_xy_global,
@@ -251,13 +249,19 @@ class AccFirstRVQTokenizer(nn.Module):
         根据加速度与初始速度积分得到速度、位移和姿态。
         """
         dt = self.dt
-        acc_xy_cum = torch.cumsum(acc_xy, dim=1)
-        vel_xy = v0_xy.unsqueeze(1) + dt * acc_xy_cum
+        t_steps = acc_xy.shape[1]
+        # 约定：vel[0] 由 v0 直接定义；acc[t] 仅用于从 vel[t-1] 积分到 vel[t] (t>=1)
+        vel_xy = torch.zeros_like(acc_xy)
+        vel_xy[:, 0, :] = v0_xy
+        if t_steps > 1:
+            vel_xy[:, 1:, :] = v0_xy.unsqueeze(1) + dt * torch.cumsum(acc_xy[:, 1:, :], dim=1)
         disp_xy_global = vel_xy * dt
         pos_xy_global = torch.cumsum(disp_xy_global, dim=1)
 
-        acc_yaw_cum = torch.cumsum(acc_yaw, dim=1)
-        yaw_rate = w0.unsqueeze(1) + dt * acc_yaw_cum
+        yaw_rate = torch.zeros_like(acc_yaw)
+        yaw_rate[:, 0] = w0
+        if t_steps > 1:
+            yaw_rate[:, 1:] = w0.unsqueeze(1) + dt * torch.cumsum(acc_yaw[:, 1:], dim=1)
         dyaw = yaw_rate * dt
         yaw = torch.cumsum(dyaw, dim=1)
 
@@ -472,10 +476,18 @@ def train_rvq_accint(
                 )
 
                 # ------- 1) acceleration-first 主损失 -------
-                acc_xy_mse_per_sample = (aux["acc_xy"] - gt_dyn["acc_xy"]).pow(2).mean(dim=(1, 2))
+                if model.input_steps > 1:
+                    # acc[0] 不参与监督，避免与 v0/vel[0] 的定义产生 off-by-one 冲突
+                    acc_xy_mse_per_sample = (
+                        aux["acc_xy"][:, 1:, :] - gt_dyn["acc_xy"][:, 1:, :]
+                    ).pow(2).mean(dim=(1, 2))
+                    acc_yaw_mse_per_sample = (
+                        aux["acc_yaw"][:, 1:] - gt_dyn["acc_yaw"][:, 1:]
+                    ).pow(2).mean(dim=1)
+                else:
+                    acc_xy_mse_per_sample = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+                    acc_yaw_mse_per_sample = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
                 acc_xy_loss = (acc_xy_mse_per_sample * sample_weight).mean()
-
-                acc_yaw_mse_per_sample = (aux["acc_yaw"] - gt_dyn["acc_yaw"]).pow(2).mean(dim=1)
                 acc_yaw_loss = (acc_yaw_mse_per_sample * sample_weight).mean()
 
                 # ------- 2) 初始状态损失 -------
