@@ -383,9 +383,11 @@ def train_rvq_accint(
         total_end_xy = 0.0
         total_end_yaw = 0.0
         total_traj = 0.0
+        total_final_pos = 0.0
         total_speed_boundary = 0.0
         total_speed_profile = 0.0
         total_acc_smooth = 0.0
+        total_speed_weight = 0.0
 
         total_ade = 0.0
         total_fde = 0.0
@@ -407,29 +409,41 @@ def train_rvq_accint(
                 gt_pos_xy, gt_yaw, _ = integrate_local_to_global_with_yaw(gt_phys)
                 gt_end_xy = gt_pos_xy[:, -1, :]
                 gt_end_yaw = gt_yaw[:, -1]
+                gt_speed = torch.sqrt(gt_phys[..., 0] ** 2 + gt_phys[..., 1] ** 2 + 1e-6) / model.dt
+                gt_avg_speed = gt_speed.mean(dim=1)
+
+                # 速度/转向感知权重：提高高速与大转向样本在 batch 内的话语权
+                speed_weight = 1.0 + torch.clamp(gt_avg_speed / 15.0, min=0.0, max=2.5)
+                turn_weight = 1.0 + torch.clamp(gt_end_yaw.abs() / 1.2, min=0.0, max=1.5)
+                sample_weight = torch.clamp(0.75 * speed_weight + 0.25 * turn_weight, min=1.0, max=4.0)
 
                 # ------- 1) 重建损失（归一化空间） -------
-                mse_dxdy = F.mse_loss(x_recon[..., :2], x[..., :2])
-                mse_dyaw = F.mse_loss(x_recon[..., 2], x[..., 2])
-                recon_loss = mse_dxdy + 14.0 * mse_dyaw
+                mse_dxdy_per_sample = (x_recon[..., :2] - x[..., :2]).pow(2).mean(dim=(1, 2))
+                mse_dyaw_per_sample = (x_recon[..., 2] - x[..., 2]).pow(2).mean(dim=1)
+                recon_loss = ((mse_dxdy_per_sample + 14.0 * mse_dyaw_per_sample) * sample_weight).mean()
 
                 # ------- 2) 末端边界损失 -------
-                end_xy_loss = F.mse_loss(aux["end_xy"], gt_end_xy)
-                end_yaw_loss = F.mse_loss(aux["end_yaw"], gt_end_yaw)
+                end_xy_err2 = (aux["end_xy"] - gt_end_xy).pow(2).sum(dim=1)
+                end_xy_loss = (end_xy_err2 * sample_weight).mean()
+                end_yaw_err2 = (aux["end_yaw"] - gt_end_yaw).pow(2)
+                end_yaw_loss = (end_yaw_err2 * turn_weight).mean()
 
                 # ------- 3) 全局轨迹损失 -------
-                traj_global_loss = F.mse_loss(aux["pos_xy_global"], gt_pos_xy)
+                traj_err2_per_sample = (aux["pos_xy_global"] - gt_pos_xy).pow(2).sum(dim=2).mean(dim=1)
+                traj_global_loss = (traj_err2_per_sample * sample_weight).mean()
+                final_pos_err2 = (aux["pos_xy_global"][:, -1, :] - gt_end_xy).pow(2).sum(dim=1)
+                final_pos_loss = (final_pos_err2 * sample_weight).mean()
 
                 # ------- 4) 速度约束（由首尾位置得到平均速度） -------
                 target_avg_speed = torch.norm(gt_end_xy, dim=-1) / (model.input_steps * model.dt + 1e-8)
                 pred_avg_speed = aux["speed"].mean(dim=1)
-                speed_boundary_loss = F.mse_loss(pred_avg_speed, target_avg_speed)
+                speed_boundary_loss = ((pred_avg_speed - target_avg_speed).pow(2) * speed_weight).mean()
 
                 # 速度 profile 约束（辅助稳定收敛）
                 pred_phys = model.to_phys(x_recon)
                 pred_speed = torch.sqrt(pred_phys[..., 0] ** 2 + pred_phys[..., 1] ** 2 + 1e-6) / model.dt
-                gt_speed = torch.sqrt(gt_phys[..., 0] ** 2 + gt_phys[..., 1] ** 2 + 1e-6) / model.dt
-                speed_profile_loss = F.mse_loss(pred_speed, gt_speed)
+                speed_profile_mse = (pred_speed - gt_speed).pow(2).mean(dim=1)
+                speed_profile_loss = (speed_profile_mse * speed_weight).mean()
 
                 # ------- 5) 加速度平滑项 -------
                 if model.input_steps > 1:
@@ -439,15 +453,37 @@ def train_rvq_accint(
                 else:
                     acc_smooth_loss = aux["acc_xy"].sum() * 0.0
 
-                # loss 权重
-                recon_w = 10.0
-                vq_w = 5.0
-                end_xy_w = 2.0
-                end_yaw_w = 1.0
-                traj_w = 2.0
-                speed_boundary_w = 1.0
-                speed_profile_w = 0.5
-                acc_smooth_w = 1e-3 if epoch > 20 else 0.0
+                # 分阶段 loss 权重：前期优先轨迹/末端收敛，后期加强码本压缩
+                if epoch < 20:
+                    recon_w = 12.0
+                    vq_w = 1.5
+                    end_xy_w = 3.0
+                    end_yaw_w = 1.5
+                    traj_w = 4.0
+                    final_pos_w = 3.0
+                    speed_boundary_w = 2.0
+                    speed_profile_w = 1.0
+                    acc_smooth_w = 0.0
+                elif epoch < 80:
+                    recon_w = 10.0
+                    vq_w = 3.0
+                    end_xy_w = 2.5
+                    end_yaw_w = 1.2
+                    traj_w = 3.0
+                    final_pos_w = 2.0
+                    speed_boundary_w = 1.5
+                    speed_profile_w = 0.8
+                    acc_smooth_w = 0.0
+                else:
+                    recon_w = 8.0
+                    vq_w = 5.0
+                    end_xy_w = 2.0
+                    end_yaw_w = 1.0
+                    traj_w = 2.5
+                    final_pos_w = 1.5
+                    speed_boundary_w = 1.2
+                    speed_profile_w = 0.6
+                    acc_smooth_w = 5e-4 if epoch > 120 else 0.0
 
                 loss = (
                     recon_w * recon_loss
@@ -455,6 +491,7 @@ def train_rvq_accint(
                     + end_xy_w * end_xy_loss
                     + end_yaw_w * end_yaw_loss
                     + traj_w * traj_global_loss
+                    + final_pos_w * final_pos_loss
                     + speed_boundary_w * speed_boundary_loss
                     + speed_profile_w * speed_profile_loss
                     + acc_smooth_w * acc_smooth_loss
@@ -476,9 +513,11 @@ def train_rvq_accint(
             total_end_xy += end_xy_loss.item()
             total_end_yaw += end_yaw_loss.item()
             total_traj += traj_global_loss.item()
+            total_final_pos += final_pos_loss.item()
             total_speed_boundary += speed_boundary_loss.item()
             total_speed_profile += speed_profile_loss.item()
             total_acc_smooth += acc_smooth_loss.item()
+            total_speed_weight += speed_weight.mean().item()
 
             # 指标：ADE / FDE / VRR
             with torch.no_grad():
@@ -499,19 +538,41 @@ def train_rvq_accint(
         avg_end_xy = total_end_xy / len(dataloader)
         avg_end_yaw = total_end_yaw / len(dataloader)
         avg_traj = total_traj / len(dataloader)
+        avg_final_pos = total_final_pos / len(dataloader)
         avg_speed_boundary = total_speed_boundary / len(dataloader)
         avg_speed_profile = total_speed_profile / len(dataloader)
         avg_acc_smooth = total_acc_smooth / len(dataloader)
+        avg_speed_weight = total_speed_weight / len(dataloader)
+
+        if epoch < 20:
+            recon_w, vq_w = 12.0, 1.5
+            end_xy_w, end_yaw_w = 3.0, 1.5
+            traj_w, final_pos_w = 4.0, 3.0
+            speed_boundary_w, speed_profile_w = 2.0, 1.0
+            acc_smooth_w = 0.0
+        elif epoch < 80:
+            recon_w, vq_w = 10.0, 3.0
+            end_xy_w, end_yaw_w = 2.5, 1.2
+            traj_w, final_pos_w = 3.0, 2.0
+            speed_boundary_w, speed_profile_w = 1.5, 0.8
+            acc_smooth_w = 0.0
+        else:
+            recon_w, vq_w = 8.0, 5.0
+            end_xy_w, end_yaw_w = 2.0, 1.0
+            traj_w, final_pos_w = 2.5, 1.5
+            speed_boundary_w, speed_profile_w = 1.2, 0.6
+            acc_smooth_w = 5e-4 if epoch > 120 else 0.0
 
         weighted_loss = (
-            10.0 * avg_recon
-            + 5.0 * avg_vq
-            + 2.0 * avg_end_xy
-            + 1.0 * avg_end_yaw
-            + 2.0 * avg_traj
-            + 1.0 * avg_speed_boundary
-            + 0.5 * avg_speed_profile
-            + (1e-3 if epoch > 20 else 0.0) * avg_acc_smooth
+            recon_w * avg_recon
+            + vq_w * avg_vq
+            + end_xy_w * avg_end_xy
+            + end_yaw_w * avg_end_yaw
+            + traj_w * avg_traj
+            + final_pos_w * avg_final_pos
+            + speed_boundary_w * avg_speed_boundary
+            + speed_profile_w * avg_speed_profile
+            + acc_smooth_w * avg_acc_smooth
         )
 
         writer.add_scalar("loss/recon", avg_recon, epoch + 1)
@@ -519,6 +580,7 @@ def train_rvq_accint(
         writer.add_scalar("loss/end_xy", avg_end_xy, epoch + 1)
         writer.add_scalar("loss/end_yaw", avg_end_yaw, epoch + 1)
         writer.add_scalar("loss/traj_global", avg_traj, epoch + 1)
+        writer.add_scalar("loss/final_pos", avg_final_pos, epoch + 1)
         writer.add_scalar("loss/speed_boundary", avg_speed_boundary, epoch + 1)
         writer.add_scalar("loss/speed_profile", avg_speed_profile, epoch + 1)
         writer.add_scalar("loss/acc_smooth", avg_acc_smooth, epoch + 1)
@@ -537,10 +599,11 @@ def train_rvq_accint(
                 f"[AccIntRVQ] Epoch {epoch+1:03d} | "
                 f"Recon: {avg_recon:.5f} | VQ: {avg_vq:.5f} | "
                 f"EndXY: {avg_end_xy:.5f} | EndYaw: {avg_end_yaw:.5f} | "
-                f"Traj: {avg_traj:.5f} | SpeedB: {avg_speed_boundary:.5f} | "
+                f"Traj: {avg_traj:.5f} | FinalPos: {avg_final_pos:.5f} | SpeedB: {avg_speed_boundary:.5f} | "
                 f"SpeedP: {avg_speed_profile:.5f} | AccSmooth: {avg_acc_smooth:.5f} | "
                 f"ADE: {avg_ade:.4f} m | FDE: {avg_fde:.4f} m | VRR: {vrr:.4f} | "
                 f"speed_mean: {mean_speed:.2f} m/s | end_dist_mean: {mean_end_dist:.2f} m | "
+                f"speed_w: {avg_speed_weight:.2f} | "
                 f"|acc|_mean: {mean_acc:.2f}"
             )
 
