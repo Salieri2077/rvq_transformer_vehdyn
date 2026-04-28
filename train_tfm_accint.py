@@ -322,7 +322,7 @@ class AccFirstRVQTokenizer(nn.Module):
 
 def train_rvq_accint(
     data_array: np.ndarray,
-    save_dir: str = "./work_dirs/tokenizer/rvq_tfm_accfirst",
+    save_dir: str = "./work_dirs/tokenizer/rvq_tfm_accint_0423",
     data_type: str = "pred",
     batch_size: int = 4096,
 ):

@@ -22,6 +22,19 @@ def _load_traj_array(data_path: str) -> np.ndarray:
     return np.asarray(data)
 
 
+def load_traj_array(data_path: str, dtype=np.float32) -> np.ndarray:
+    """
+    通用轨迹加载接口，兼容:
+      1) npy 直接是 [N, T, 3]
+      2) npy 为 dict 且包含 'trajs'
+    """
+    arr = _load_traj_array(data_path)
+    arr = np.asarray(arr, dtype=dtype)
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        raise ValueError(f"Expected trajectory array shape [N, T, 3], got {arr.shape}")
+    return arr
+
+
 def resolve_default_data_path() -> str:
     """优先使用增强数据，若不存在则回退到基础数据。"""
     if os.path.exists(DEFAULT_AUGMENTED_DATA_PATH):
@@ -32,13 +45,157 @@ def resolve_default_data_path() -> str:
 def load_sampled_datas(data_path: str = None):
     if data_path is None:
         data_path = resolve_default_data_path()
-    return _load_traj_array(data_path)
+    return load_traj_array(data_path)
 
 
 def load_test_datas(data_path: str = None):
     if data_path is None:
         data_path = resolve_default_data_path()
-    return _load_traj_array(data_path)
+    return load_traj_array(data_path)
+
+
+def load_norm_params_torch(norm_path: str, device: torch.device):
+    """
+    加载归一化参数并转为 torch.Tensor。
+    返回字段:
+      mean, std, scale_factor, clip_limit(None 或 Tensor)
+    """
+    with open(norm_path, "rb") as f:
+        norm_params = pickle.load(f)
+    out = {
+        "mean": torch.tensor(norm_params["mean"], dtype=torch.float32, device=device),
+        "std": torch.tensor(norm_params["std"], dtype=torch.float32, device=device),
+        "scale_factor": torch.tensor(norm_params["scale_factor"], dtype=torch.float32, device=device),
+        "clip_limit": None,
+    }
+    if "clip_limit" in norm_params:
+        out["clip_limit"] = torch.tensor(norm_params["clip_limit"], dtype=torch.float32, device=device)
+    return out
+
+
+def normalize_trajs_torch(
+    trajs: np.ndarray,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    scale_factor: torch.Tensor,
+    clip_limit: torch.Tensor = None,
+) -> torch.Tensor:
+    x = torch.tensor(trajs, dtype=torch.float32, device=mean.device)
+    x_norm = (x - mean) / (std + 1e-8)
+    if clip_limit is not None:
+        x_norm = torch.clamp(x_norm, -clip_limit, clip_limit)
+    return x_norm / (scale_factor + 1e-8)
+
+
+def denormalize_trajs_torch(
+    x_norm: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    scale_factor: torch.Tensor,
+) -> torch.Tensor:
+    return x_norm * scale_factor * (std + 1e-8) + mean
+
+
+def finite_diff_keep_shape(x: np.ndarray, dt: float) -> np.ndarray:
+    if x.shape[-1] <= 1:
+        return np.zeros_like(x)
+    d = np.diff(x, axis=-1) / (dt + 1e-8)
+    return np.concatenate([d[..., :1], d], axis=-1)
+
+
+def moving_average_1d_time(x: np.ndarray, window: int) -> np.ndarray:
+    """
+    对最后一维做简单滑动平均，保持形状不变。
+    x: [..., T]
+    """
+    if window <= 1:
+        return x
+    kernel = np.ones(int(window), dtype=np.float32) / float(window)
+    flat = x.reshape(-1, x.shape[-1])
+    out = np.empty_like(flat)
+    for i in range(flat.shape[0]):
+        out[i] = np.convolve(flat[i], kernel, mode="same")
+    return out.reshape(x.shape)
+
+
+def compute_extended_kinematic_quantities(
+    profile: dict,
+    dt: float,
+    curvature_clip: float = 2.0,
+    jerk_smooth_window: int = 3,
+):
+    """
+    从 compute_kinematic_profiles 的输出计算扩展物理量。
+    统一在多个 eval 里复用。
+    """
+    eps = 1e-8
+    vx = profile["vx"]
+    vy = profile["vy"]
+    ax = profile["ax"]
+    ay = profile["ay"]
+    speed = profile["speed"]
+    yaw_rate = profile["yaw_rate"]
+    disp_xy = profile["disp_xy"]
+
+    curvature_raw = (vx * ay - vy * ax) / (np.power(speed, 3) + eps)
+    curvature_raw = np.where(speed < 0.2, 0.0, curvature_raw)
+    if curvature_clip is not None and curvature_clip > 0:
+        curvature_raw = np.clip(curvature_raw, -curvature_clip, curvature_clip)
+
+    lat_acc = (speed ** 2) * curvature_raw
+    abs_lat_acc = np.abs(lat_acc)
+
+    ax_for_jerk = moving_average_1d_time(ax, window=jerk_smooth_window)
+    ay_for_jerk = moving_average_1d_time(ay, window=jerk_smooth_window)
+    jerk_x = finite_diff_keep_shape(ax_for_jerk, dt=dt)
+    jerk_y = finite_diff_keep_shape(ay_for_jerk, dt=dt)
+    jerk_abs = np.sqrt(jerk_x**2 + jerk_y**2 + 1e-6)
+
+    curvature_rate = finite_diff_keep_shape(curvature_raw, dt=dt)
+    abs_curvature_rate = np.abs(curvature_rate)
+
+    kinematic_error = np.abs(yaw_rate - speed * curvature_raw)
+
+    disp_norm = np.sqrt(np.sum(disp_xy ** 2, axis=-1) + eps)
+    unit_disp = disp_xy / disp_norm[..., None]
+    dot = np.sum(unit_disp[:, 1:] * unit_disp[:, :-1], axis=-1)
+    dot = np.clip(dot, -1.0, 1.0)
+    angle = np.arccos(dot)
+    turn_angle_jump = np.zeros_like(speed)
+    turn_angle_jump[:, 1:] = angle
+
+    dot_full = np.ones_like(speed)
+    dot_full[:, 1:] = dot
+    speed_prev = np.concatenate([speed[:, :1], speed[:, :-1]], axis=1)
+
+    return {
+        "curvature_raw": curvature_raw,
+        "lat_acc": lat_acc,
+        "abs_lat_acc": abs_lat_acc,
+        "jerk_x": jerk_x,
+        "jerk_y": jerk_y,
+        "jerk_abs": jerk_abs,
+        "curvature_rate": curvature_rate,
+        "abs_curvature_rate": abs_curvature_rate,
+        "kinematic_error": kinematic_error,
+        "turn_angle_jump": turn_angle_jump,
+        "turn_dot": dot_full,
+        "speed_prev": speed_prev,
+    }
+
+
+def longest_true_run(mask_1d: np.ndarray) -> int:
+    """返回布尔序列中 True 的最长连续长度。"""
+    best = 0
+    cur = 0
+    for v in mask_1d.astype(bool):
+        if v:
+            cur += 1
+            if cur > best:
+                best = cur
+        else:
+            cur = 0
+    return int(best)
 
 
 def count_longitudinal_sign_changes(local_vx: np.ndarray, speed_th: float = 0.2) -> np.ndarray:
