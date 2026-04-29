@@ -522,7 +522,13 @@ def infer_model_type(model_path: str, model_type: str) -> str:
     return "taae"
 
 
-def build_model(model_path: str, input_steps: int, device: torch.device, model_type: str) -> ModelUnion:
+def build_model(
+    model_path: str,
+    input_steps: int,
+    device: torch.device,
+    model_type: str,
+    num_transformer_layers: int = 2,
+) -> ModelUnion:
     if model_type == "accint":
         model = AccFirstRVQTokenizer(
             input_steps=input_steps,
@@ -531,7 +537,7 @@ def build_model(model_path: str, input_steps: int, device: torch.device, model_t
             vocab_size=1024,
             d_model=128,
             nhead=4,
-            num_transformer_layers=2,
+            num_transformer_layers=num_transformer_layers,
             dt=0.2,
         ).to(device)
     else:
@@ -542,7 +548,7 @@ def build_model(model_path: str, input_steps: int, device: torch.device, model_t
             vocab_size=1024,
             d_model=128,
             nhead=4,
-            num_transformer_layers=2,
+            num_transformer_layers=num_transformer_layers,
         ).to(device)
     state_dict = torch.load(model_path, map_location=device)
     model.load_state_dict(state_dict, strict=True)
@@ -580,6 +586,7 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--num-var-plots", type=int, default=3)
     parser.add_argument("--num-worst-plots", type=int, default=3)
+    parser.add_argument("--num-transformer-layers", type=int, default=2)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -603,7 +610,13 @@ def main():
     if args.data_type == "history":
         trajs = trajs[:, :14, :]
 
-    model = build_model(model_path, input_steps=trajs.shape[1], device=device, model_type=resolved_model_type)
+    model = build_model(
+        model_path,
+        input_steps=trajs.shape[1],
+        device=device,
+        model_type=resolved_model_type,
+        num_transformer_layers=args.num_transformer_layers,
+    )
     norm_params = load_norm_params(norm_path, device)
     model.set_norm_params(norm_params["mean"], norm_params["std"], norm_params["scale_factor"])
 
@@ -707,6 +720,7 @@ def main():
             "output_dir": output_dir,
             "num_var_plots": args.num_var_plots,
             "num_worst_plots": args.num_worst_plots,
+            "num_transformer_layers": args.num_transformer_layers,
         },
         "overall": overall_metrics,
         "scenarios": metrics_by_scenario,

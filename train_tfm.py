@@ -351,6 +351,7 @@ def train_rvq_taae(
     data_type: str = "pred",
     batch_size: int = 4096,
     num_layers: int = 15,
+    num_transformer_layers: int = 2,
     epochs: int = 500,
 ):
     """
@@ -391,7 +392,7 @@ def train_rvq_taae(
         vocab_size=1024,
         d_model=128,  # 128
         nhead=4,  # 4
-        num_transformer_layers=2,
+        num_transformer_layers=num_transformer_layers,
     ).to(device)
     
     # 使用 torch.compile 加速（PyTorch 2.0+，可提升 20-30% 速度）
@@ -678,6 +679,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-type", type=str, default="pred", choices=["pred", "history"])
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--num-layers", type=int, default=15)
+    parser.add_argument("--num-transformer-layers", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--max-samples", type=int, default=0)
     args = parser.parse_args()
@@ -690,6 +692,7 @@ if __name__ == "__main__":
 
     print(
         f"Train config | data_type={args.data_type} | num_layers={args.num_layers} | "
+        f"num_transformer_layers={args.num_transformer_layers} | "
         f"batch_size={args.batch_size} | epochs={args.epochs} | save_dir={args.save_dir}"
     )
     print(f"Dataset shape: {sampled_trajs.shape}")
@@ -700,5 +703,6 @@ if __name__ == "__main__":
         data_type=args.data_type,
         batch_size=args.batch_size,
         num_layers=args.num_layers,
+        num_transformer_layers=args.num_transformer_layers,
         epochs=args.epochs,
     )
