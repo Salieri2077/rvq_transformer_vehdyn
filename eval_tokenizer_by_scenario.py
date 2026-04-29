@@ -3,7 +3,7 @@ import csv
 import json
 import os
 import pickle
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -59,6 +59,30 @@ def normalize_trajs(
 
 def denormalize_trajs(x_norm: torch.Tensor, mean: torch.Tensor, std: torch.Tensor, scale_factor: torch.Tensor) -> torch.Tensor:
     return x_norm * scale_factor * (std + 1e-8) + mean
+
+
+def traj_signature(traj: np.ndarray, decimals: int = 6) -> bytes:
+    rounded = np.round(np.asarray(traj, dtype=np.float32), decimals=decimals)
+    return np.ascontiguousarray(rounded).tobytes()
+
+
+def build_exclude_indices_for_worst(
+    representatives: Dict[str, Dict],
+    variation_representatives: Dict[str, List[Dict]],
+) -> Dict[str, List[int]]:
+    out: Dict[str, List[int]] = {}
+    scenario_names = set(representatives.keys()) | set(variation_representatives.keys())
+    for scenario_name in scenario_names:
+        exclude_idxs: List[int] = []
+        rep_idx = representatives.get(scenario_name, {}).get("idx")
+        if rep_idx is not None:
+            exclude_idxs.append(int(rep_idx))
+        for item in variation_representatives.get(scenario_name, []):
+            idx = item.get("idx")
+            if idx is not None:
+                exclude_idxs.append(int(idx))
+        out[scenario_name] = exclude_idxs
+    return out
 
 
 def select_representative_indices(categories: Dict[str, np.ndarray], feat: Dict[str, np.ndarray]) -> Dict[str, Dict]:
@@ -169,8 +193,10 @@ def select_velocity_acc_variation_indices(
             out[scenario_name] = []
             continue
 
+        used_signatures: Set[bytes] = set()
         classic_idx = exclude_indices.get(scenario_name, {}).get("idx")
         if classic_idx is not None:
+            used_signatures.add(traj_signature(trajs[int(classic_idx)]))
             idxs = idxs[idxs != classic_idx]
         if len(idxs) == 0:
             out[scenario_name] = []
@@ -202,24 +228,33 @@ def select_velocity_acc_variation_indices(
                 + scenario_curvature_abs_mean / (scenario_curvature_abs_mean.max() + 1e-6)
             )
 
-        order = np.argsort(-score)[:num_samples]
-        out[scenario_name] = [
-            {
-                "idx": int(idxs[i]),
-                "info": {
-                    "speed_std_mps": float(speed_std[idxs[i]]),
-                    "acc_std_mps2": float(acc_std[idxs[i]]),
-                    "acc_abs_mean_mps2": float(acc_abs_mean[idxs[i]]),
-                    "curvature_std_1pm": float(curvature_std[idxs[i]]),
-                    "curvature_abs_mean_1pm": float(curvature_abs_mean[idxs[i]]),
-                    "reverse_ratio": float(reverse_ratio[idxs[i]]),
-                    "reverse_dist_m": float(reverse_dist[idxs[i]]),
-                    "stop_ratio": float(stop_ratio[idxs[i]]),
-                    "long_vel_sign_changes": int(long_vel_sign_changes[idxs[i]]),
-                },
-            }
-            for i in order
-        ]
+        order = np.argsort(-score)
+        selected_items: List[Dict] = []
+        for i in order:
+            sample_idx = int(idxs[i])
+            sign = traj_signature(trajs[sample_idx])
+            if sign in used_signatures:
+                continue
+            used_signatures.add(sign)
+            selected_items.append(
+                {
+                    "idx": sample_idx,
+                    "info": {
+                        "speed_std_mps": float(speed_std[sample_idx]),
+                        "acc_std_mps2": float(acc_std[sample_idx]),
+                        "acc_abs_mean_mps2": float(acc_abs_mean[sample_idx]),
+                        "curvature_std_1pm": float(curvature_std[sample_idx]),
+                        "curvature_abs_mean_1pm": float(curvature_abs_mean[sample_idx]),
+                        "reverse_ratio": float(reverse_ratio[sample_idx]),
+                        "reverse_dist_m": float(reverse_dist[sample_idx]),
+                        "stop_ratio": float(stop_ratio[sample_idx]),
+                        "long_vel_sign_changes": int(long_vel_sign_changes[sample_idx]),
+                    },
+                }
+            )
+            if len(selected_items) >= num_samples:
+                break
+        out[scenario_name] = selected_items
     return out
 
 ModelUnion = Union[TrajRVQTransformer, AccFirstRVQTokenizer]
@@ -309,6 +344,7 @@ def select_worst_reconstruction_indices(
     categories: Dict[str, np.ndarray],
     num_samples: int,
     dt: float,
+    exclude_indices: Optional[Dict[str, List[int]]] = None,
 ) -> Dict[str, List[Dict]]:
     gt_prof = compute_kinematic_profiles(trajs, dt=dt)
     pred_prof = compute_kinematic_profiles(recon_trajs, dt=dt)
@@ -332,21 +368,35 @@ def select_worst_reconstruction_indices(
             out[scenario_name] = []
             continue
 
-        order = np.argsort(-ade[idxs])[:num_samples]
-        out[scenario_name] = [
-            {
-                "idx": int(idxs[i]),
-                "info": {
-                    "ade_m": float(ade[idxs[i]]),
-                    "fde_m": float(fde[idxs[i]]),
-                    "max_error_m": float(max_error[idxs[i]]),
-                    "speed_mae_mps": float(speed_mae[idxs[i]]),
-                    "acc_mae_mps2": float(acc_mae[idxs[i]]),
-                    "curvature_mae_1pm": float(curvature_mae[idxs[i]]),
-                },
-            }
-            for i in order
-        ]
+        used_signatures: Set[bytes] = set()
+        if exclude_indices is not None:
+            for ex_idx in exclude_indices.get(scenario_name, []):
+                used_signatures.add(traj_signature(trajs[int(ex_idx)]))
+
+        order = np.argsort(-ade[idxs])
+        selected_items: List[Dict] = []
+        for i in order:
+            sample_idx = int(idxs[i])
+            sign = traj_signature(trajs[sample_idx])
+            if sign in used_signatures:
+                continue
+            used_signatures.add(sign)
+            selected_items.append(
+                {
+                    "idx": sample_idx,
+                    "info": {
+                        "ade_m": float(ade[sample_idx]),
+                        "fde_m": float(fde[sample_idx]),
+                        "max_error_m": float(max_error[sample_idx]),
+                        "speed_mae_mps": float(speed_mae[sample_idx]),
+                        "acc_mae_mps2": float(acc_mae[sample_idx]),
+                        "curvature_mae_1pm": float(curvature_mae[sample_idx]),
+                    },
+                }
+            )
+            if len(selected_items) >= num_samples:
+                break
+        out[scenario_name] = selected_items
     return out
 
 
@@ -357,6 +407,7 @@ def plot_representative_case(
     pred_traj: np.ndarray,
     dt: float,
     save_path: str,
+    sample_tokens: Optional[np.ndarray] = None,
 ):
     gt_prof = compute_kinematic_profiles(gt_traj[None, ...], dt)
     pred_prof = compute_kinematic_profiles(pred_traj[None, ...], dt)
@@ -450,8 +501,14 @@ def plot_representative_case(
     ax_a.grid(True, alpha=0.3)
     ax_a.legend(fontsize=8)
 
-    fig.suptitle(f"{scenario_name} | sample_idx={sample_idx}")
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    title = f"{scenario_name} | sample_idx={sample_idx}"
+    if sample_tokens is not None:
+        token_values = np.asarray(sample_tokens).reshape(-1)[:15]
+        token_values_str = ", ".join(str(int(v)) for v in token_values)
+        title = f"{title}\nTokens(15): [{token_values_str}]"
+
+    fig.suptitle(title)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(save_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -569,12 +626,14 @@ def main():
         num_samples=args.num_var_plots,
         exclude_indices=representatives,
     )
+    worst_exclude_indices = build_exclude_indices_for_worst(representatives, variation_representatives)
     worst_representatives = select_worst_reconstruction_indices(
         trajs=trajs,
         recon_trajs=recon_trajs,
         categories=categories,
         num_samples=args.num_worst_plots,
         dt=args.dt,
+        exclude_indices=worst_exclude_indices,
     )
 
     total_samples = max(int(len(trajs)), 1)
@@ -609,6 +668,7 @@ def main():
                 pred_traj=recon_trajs[rep_idx],
                 dt=args.dt,
                 save_path=os.path.join(output_dir, f"{scenario_name}_classic.png"),
+                sample_tokens=codes[rep_idx],
             )
         for plot_id, item in enumerate(variation_representatives[scenario_name], start=1):
             var_idx = item["idx"]
@@ -619,6 +679,7 @@ def main():
                 pred_traj=recon_trajs[var_idx],
                 dt=args.dt,
                 save_path=os.path.join(output_dir, f"{scenario_name}_var{plot_id:02d}.png"),
+                sample_tokens=codes[var_idx],
             )
         for plot_id, item in enumerate(worst_representatives[scenario_name], start=1):
             worst_idx = item["idx"]
@@ -629,6 +690,7 @@ def main():
                 pred_traj=recon_trajs[worst_idx],
                 dt=args.dt,
                 save_path=os.path.join(output_dir, f"{scenario_name}_worst_{plot_id:02d}.png"),
+                sample_tokens=codes[worst_idx],
             )
 
     overall_metrics = scenario_metrics(trajs, recon_trajs, dt=args.dt)
@@ -690,7 +752,8 @@ if __name__ == "__main__":
 #   --data-path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas_augmented_reverse_detour_directuturn_hs120.npy \
 #   --save-dir ./work_dirs/tokenizer/rvq_tfm_kin_0311 \
 #   --data-type pred \
-#   --num-var-plots 5 \
+#   --num-var-plots 3 \
+#   --num-worst-plots 5 \
 #   --model-type taae
 
 # python eval_tokenizer_by_scenario.py \

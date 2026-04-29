@@ -109,3 +109,18 @@ def main():
 if __name__ == "__main__":
     main()
 
+# python rvq_transformer_vehdyn/build_augmented_scenario_dataset.py \
+#   --source-path /share-global/zhe.du/planner/planNN2/tokenizer/dxdydyaw_trajs_for_tokenizer_208w.npy \
+#   --base-path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas_augmented_reverse_detour_directuturn_hs120.npy \
+#   --output-path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas_augmented_reverse_detour_directuturn_hs120.npy \
+#   --fps 5.0 \
+#   --scenarios \
+#     Stationary \
+#     Reverse \
+#     DirectUTurn \
+#     Detour \
+#     LeftTurn \
+#     RightTurn \
+#     LowSpeedStraight_10kmh \
+#     HighSpeedStraight_80kmh \
+#     HighSpeedStraight_120kmh
