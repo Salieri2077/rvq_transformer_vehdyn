@@ -81,7 +81,13 @@ class EMAVectorQuantizer(nn.Module):
         dead_indices = (cluster_size < 1e-2).nonzero(as_tuple=True)[0]
         if len(dead_indices) > 0:
             # 随机采样输入作为新的码本中心
-            indices = torch.randperm(inputs.shape[0])[:len(dead_indices)]
+            # 当 dead code 数量超过 batch 样本数时，允许有放回采样，避免 shape mismatch
+            n_dead = len(dead_indices)
+            n_inputs = int(inputs.shape[0])
+            if n_dead <= n_inputs:
+                indices = torch.randperm(n_inputs, device=inputs.device)[:n_dead]
+            else:
+                indices = torch.randint(0, n_inputs, (n_dead,), device=inputs.device)
             random_samples = inputs[indices]
             # 确保写回到 embedding / ema_w 时 dtype 一致（避免 BF16/FP16 混合精度下报错）
             random_samples = random_samples.to(self.embedding.dtype)

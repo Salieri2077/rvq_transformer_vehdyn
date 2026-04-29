@@ -1,5 +1,6 @@
 import os
 import pickle
+import argparse
 
 import numpy as np
 import torch
@@ -349,6 +350,8 @@ def train_rvq_taae(
     save_dir: str = "./work_dirs/tokenizer/rvq_taae_0205",
     data_type: str = "pred",
     batch_size: int = 4096,
+    num_layers: int = 15,
+    epochs: int = 500,
 ):
     """
     使用 TAAE 结构训练 RVQ 模型，整体流程与 train.py 中的 train_rvq 类似，
@@ -384,7 +387,7 @@ def train_rvq_taae(
     model = TrajRVQTransformer(
         input_steps=num_steps,
         input_dim=data_array.shape[2],
-        num_layers=15,  # 8
+        num_layers=num_layers,
         vocab_size=1024,
         d_model=128,  # 128
         nhead=4,  # 4
@@ -421,9 +424,6 @@ def train_rvq_taae(
         scaler = torch.cuda.amp.GradScaler()
         dtype = torch.float16
         print("Using FP16 mixed precision training")
-
-    # 4. 训练循环设置
-    epochs = 500
 
     # 学习率设置
     initial_lr = 1e-3
@@ -672,20 +672,33 @@ def train_rvq_taae(
 
 
 if __name__ == "__main__":
-    batch_size = 4096
-    # 直接复用 train.py 里的数据加载逻辑
-    # sampled_trajs = load_all_datas()
-    sampled_trajs = load_sampled_datas()
+    parser = argparse.ArgumentParser(description="Train RVQ TAAE tokenizer.")
+    parser.add_argument("--data-path", type=str, default=None)
+    parser.add_argument("--save-dir", type=str, default="./work_dirs/tokenizer/rvq_tfm_kin_0311")
+    parser.add_argument("--data-type", type=str, default="pred", choices=["pred", "history"])
+    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--num-layers", type=int, default=15)
+    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--max-samples", type=int, default=0)
+    args = parser.parse_args()
 
-    # sampled_trajs = vel_aug(sampled_trajs)
-
-    # save_dir = "./work_dirs/tokenizer/debug"
-    save_dir = "./work_dirs/tokenizer/rvq_tfm_kin_0311"
-    data_type = "pred"  # 'pred' 或 'history'
-    print('data_type:', data_type)
-
-    if data_type == "history":
-        # 历史轨迹只取前 14 步
+    sampled_trajs = load_sampled_datas(args.data_path)
+    if args.data_type == "history":
         sampled_trajs = sampled_trajs[:, :14, :]
+    if args.max_samples > 0:
+        sampled_trajs = sampled_trajs[: args.max_samples]
 
-    train_rvq_taae(sampled_trajs, save_dir, data_type, batch_size)
+    print(
+        f"Train config | data_type={args.data_type} | num_layers={args.num_layers} | "
+        f"batch_size={args.batch_size} | epochs={args.epochs} | save_dir={args.save_dir}"
+    )
+    print(f"Dataset shape: {sampled_trajs.shape}")
+
+    train_rvq_taae(
+        sampled_trajs,
+        save_dir=args.save_dir,
+        data_type=args.data_type,
+        batch_size=args.batch_size,
+        num_layers=args.num_layers,
+        epochs=args.epochs,
+    )
