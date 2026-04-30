@@ -8,6 +8,7 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.patches import Patch
 
 try:
     from train_tfm import TrajRVQTransformer
@@ -334,12 +335,21 @@ def plot_top1_map_compare(
         c = j % cols
         axes[r][c].axis("off")
 
-    legend_lines = ["-1: unused"] + [f"{i}: {q}" for q, i in q_to_id.items()]
-    fig.suptitle(
-        "Scenario x Layer Top1 Controlled Quantity (Compare K)\n" + ";  ".join(legend_lines),
-        fontsize=11,
+    legend_handles = [Patch(facecolor=colors[0], edgecolor="black", label="-1 unused")]
+    for i, q in enumerate(quantities):
+        legend_handles.append(Patch(facecolor=colors[i + 1], edgecolor="black", label=f"{i} {q}"))
+
+    fig.legend(
+        handles=legend_handles,
+        loc="center left",
+        bbox_to_anchor=(0.86, 0.5),
+        frameon=True,
+        title="Legend",
+        fontsize=9,
+        title_fontsize=10,
     )
-    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.90])
+    fig.suptitle("Scenario x Layer Top1 Controlled Quantity (Compare K)", fontsize=12)
+    fig.tight_layout(rect=[0.0, 0.0, 0.84, 0.92])
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
