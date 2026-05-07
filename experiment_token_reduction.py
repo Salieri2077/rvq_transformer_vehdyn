@@ -255,7 +255,8 @@ def plot_control_heatmap_compare(
         r = i // cols
         c = i % cols
         ax = axes[r][c]
-        im = ax.imshow(mats[k], aspect="auto", cmap=cmap, vmin=0.0, vmax=vmax)
+        mat = mats[k]
+        im = ax.imshow(mat, aspect="auto", cmap=cmap, vmin=0.0, vmax=vmax)
         ax.set_title(f"K={k}")
         ax.set_xticks(np.arange(len(quantities)))
         ax.set_xticklabels(quantities, rotation=45, ha="right", fontsize=8)
@@ -263,6 +264,18 @@ def plot_control_heatmap_compare(
         ax.set_yticklabels([f"L{l:02d}" for l in range(max_layers)], fontsize=8)
         ax.set_xlabel("Quantity")
         ax.set_ylabel("Layer")
+
+        # Annotate each valid heatmap cell with 3 decimal places.
+        for y in range(mat.shape[0]):
+            for x in range(mat.shape[1]):
+                v = mat[y, x]
+                if not np.isfinite(v):
+                    continue
+                norm_v = float(v / (vmax + 1e-12))
+                r_c, g_c, b_c, _ = cmap(norm_v)
+                luminance = 0.299 * r_c + 0.587 * g_c + 0.114 * b_c
+                txt_color = "black" if luminance > 0.62 else "white"
+                ax.text(x, y, f"{v:.3f}", ha="center", va="center", fontsize=6, color=txt_color)
 
     for j in range(n, rows_n * cols):
         r = j // cols
