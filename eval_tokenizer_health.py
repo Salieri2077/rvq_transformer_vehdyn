@@ -2,6 +2,7 @@ import os
 import pickle
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 
 # 导入你原有的模型和工具函数
@@ -10,13 +11,87 @@ from utils import load_sampled_datas,load_test_datas
 
 from train_tfm import TrajRVQTransformer
 
+
+def _integrate_to_global_np(traj: np.ndarray) -> np.ndarray:
+    dx = traj[:, 0]
+    dy = traj[:, 1]
+    dyaw = traj[:, 2]
+    yaw = np.cumsum(dyaw, axis=0)
+    prev_yaw = np.zeros_like(yaw)
+    if len(yaw) > 1:
+        prev_yaw[1:] = yaw[:-1]
+
+    dx_global = dx * np.cos(prev_yaw) - dy * np.sin(prev_yaw)
+    dy_global = dx * np.sin(prev_yaw) + dy * np.cos(prev_yaw)
+    x_global = np.cumsum(dx_global, axis=0)
+    y_global = np.cumsum(dy_global, axis=0)
+    return np.stack([x_global, y_global], axis=-1)
+
+
+def _plot_noise_recon_cases(cases, save_path: str):
+    if len(cases) == 0:
+        return []
+
+    save_dir = os.path.dirname(save_path) or "."
+    os.makedirs(save_dir, exist_ok=True)
+    base = os.path.basename(save_path)
+    stem, ext = os.path.splitext(base)
+    if ext == "":
+        ext = ".png"
+
+    saved_paths = []
+    for i, case in enumerate(cases):
+        fig, ax = plt.subplots(1, 1, figsize=(10, 4.8))
+        gt_xy = _integrate_to_global_np(case["gt_phys"])
+        clean_xy = _integrate_to_global_np(case["recon_clean_phys"])
+        noisy_xy = _integrate_to_global_np(case["recon_noisy_phys"])
+
+        ax.plot(gt_xy[:, 0], gt_xy[:, 1], label="GT", linewidth=2.2, color="#1f77b4")
+        ax.plot(clean_xy[:, 0], clean_xy[:, 1], label="Recon(clean token)", linewidth=2.0, linestyle="--", color="#2ca02c")
+        ax.plot(noisy_xy[:, 0], noisy_xy[:, 1], label="Recon(noisy token)", linewidth=2.0, linestyle="-.", color="#d62728")
+
+        ax.scatter(gt_xy[0, 0], gt_xy[0, 1], c="black", s=20)
+        # 细长轨迹（x 远大于 y）若强制 equal，会把图压扁到几乎不可读。
+        # x_span = float(np.max(gt_xy[:, 0]) - np.min(gt_xy[:, 0]) + 1e-6)
+        # y_span = float(np.max(gt_xy[:, 1]) - np.min(gt_xy[:, 1]) + 1e-6)
+        # slender_ratio = x_span / y_span
+        # if slender_ratio <= 8.0:
+        #     ax.set_aspect("equal", adjustable="box")
+        # else:
+        #     ax.set_aspect("auto")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, loc="best")
+
+        clean_tokens = ",".join(str(int(v)) for v in case["tokens_clean"])
+        noisy_tokens = ",".join(str(int(v)) for v in case["tokens_noisy"])
+        ax.set_title(
+            f'sample#{case["sample_idx"]} | same_layers={case["same_layers"]}/{case["num_layers"]}\n'
+            f"clean tokens: [{clean_tokens}]\n"
+            f"noisy tokens: [{noisy_tokens}]",
+            fontsize=9,
+        )
+
+        fig.suptitle("Tokenizer Noise Robustness: clean/noisy token recon comparison", fontsize=13)
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+        sample_id = int(case["sample_idx"])
+        per_path = os.path.join(save_dir, f"{stem}_sample{sample_id:06d}_{i:02d}{ext}")
+        fig.savefig(per_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        saved_paths.append(per_path)
+
+    return saved_paths
+
+
 def evaluate_tokenizer_health(
     model: TrajRVQTransformer,
     dataloader: DataLoader,
     device: torch.device,
-    noise_std_xy: float = 0.05,  # 给物理空间的 dx, dy 加入 5cm 的扰动
+    noise_std_xy: float = 0.01,  # 给物理空间的 dx, dy 加入 1cm 的扰动
     noise_std_yaw: float = 0.01,  # 给物理空间的 dyaw 加入 0.01 弧度的扰动
     clip_limit: torch.Tensor = None,
+    vis_num_cases: int = 6,
+    vis_save_path: str = None,
 ):
     """
     评估 Tokenizer 的健康度与拓扑稳定性。
@@ -37,13 +112,17 @@ def evaluate_tokenizer_health(
     total_samples = 0
     overlap_count_per_layer = torch.zeros(num_layers).to(device)
     exact_match_all_layers = 0  # 记录所有层 Token 都完全一致的极端苛刻情况
+    vis_cases = []
 
     print(f"开始评估 Tokenizer 健康度... (注入物理噪声: XY ±{noise_std_xy}m, Yaw ±{noise_std_yaw}rad)")
+    if vis_save_path is None:
+        vis_save_path = os.path.join(os.getcwd(), "tokenizer_health_noise_recon.png")
 
     with torch.no_grad():
         for batch in dataloader:
             x_norm = batch[0].to(device)
             B = x_norm.shape[0]
+            batch_start_idx = total_samples
             total_samples += B
             
             # ==========================================
@@ -86,6 +165,30 @@ def evaluate_tokenizer_health(
             # ==========================================
             z_noisy = model.encode(x_norm_noisy)
             _, _, codes_noisy = model.rvq(z_noisy) # codes_noisy: [B, num_layers]
+
+            # 可视化样本（尽量少改动主逻辑）：展示 clean/noisy token 对应重建轨迹差异
+            need = max(0, int(vis_num_cases) - len(vis_cases))
+            if need > 0:
+                take = min(need, B)
+                x_recon_clean_norm = model.decode_from_codes(codes_clean[:take])
+                x_recon_noisy_norm = model.decode_from_codes(codes_noisy[:take])
+                x_recon_clean_phys = (x_recon_clean_norm * model.norm_scale * model.norm_std) + model.norm_mean
+                x_recon_noisy_phys = (x_recon_noisy_norm * model.norm_scale * model.norm_std) + model.norm_mean
+
+                same_layers = (codes_clean[:take] == codes_noisy[:take]).sum(dim=1).cpu().numpy()
+                for j in range(take):
+                    vis_cases.append(
+                        {
+                            "sample_idx": int(batch_start_idx + j),
+                            "gt_phys": x_phys[j].cpu().numpy(),
+                            "recon_clean_phys": x_recon_clean_phys[j].cpu().numpy(),
+                            "recon_noisy_phys": x_recon_noisy_phys[j].cpu().numpy(),
+                            "tokens_clean": codes_clean[j].cpu().numpy(),
+                            "tokens_noisy": codes_noisy[j].cpu().numpy(),
+                            "same_layers": int(same_layers[j]),
+                            "num_layers": int(num_layers),
+                        }
+                    )
 
             # ==========================================
             # 4. 计算 Overlap Rate (重叠率)
@@ -161,6 +264,12 @@ def evaluate_tokenizer_health(
     print(f"全层完美重合率: {exact_match_all_layers / total_samples * 100:.2f}%")
     if avg_or < 50:
         print("警告: Tokenizer 对物理噪音极其敏感！ downstream VLA将难以收敛。")
+
+    # 画在一个画布上：clean/noisy 重建 + 各自 token 激活值
+    saved_paths = _plot_noise_recon_cases(vis_cases, vis_save_path)
+    if len(saved_paths) > 0:
+        print(f"已保存可视化对比图(每样本一张): {os.path.dirname(saved_paths[0])}")
+        print(f"图像数量: {len(saved_paths)}，文件前缀: {os.path.basename(vis_save_path)}")
     print("="*50 + "\n")
 
     return avg_utilization / num_layers, avg_or
