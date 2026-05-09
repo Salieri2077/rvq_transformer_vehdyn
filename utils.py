@@ -237,24 +237,27 @@ def compute_kinematic_profiles(trajs: np.ndarray, dt: float):
     disp_xy = np.stack([dx_global, dy_global], axis=-1)
     xy = np.cumsum(disp_xy, axis=1)
 
-    vx = dx_global / (dt + eps)
-    vy = dy_global / (dt + eps)
-    speed = np.sqrt(vx**2 + vy**2 + 1e-6)
-
+    # 改为与 detect-2.py 一致的中心差分思路：
+    # 先对全局位置 xy 做一阶 gradient 得速度，再对速度做 gradient 得加速度。
+    # 相比 diff，更不容易在边界和高频抖动处产生尖峰。
     if t > 1:
-        raw_ax = np.diff(vx, axis=1) / (dt + eps)
-        raw_ay = np.diff(vy, axis=1) / (dt + eps)
-        ax = np.concatenate([raw_ax[:, :1], raw_ax], axis=1)
-        ay = np.concatenate([raw_ay[:, :1], raw_ay], axis=1)
+        vel = np.gradient(xy, axis=1) / (dt + eps)  # [N, T, 2]
+        vx = vel[..., 0]
+        vy = vel[..., 1]
+        acc_vec = np.gradient(vel, axis=1) / (dt + eps)  # [N, T, 2]
+        ax = acc_vec[..., 0]
+        ay = acc_vec[..., 1]
     else:
+        vx = np.zeros((n, t), dtype=clips.dtype)
+        vy = np.zeros((n, t), dtype=clips.dtype)
         ax = np.zeros_like(vx)
         ay = np.zeros_like(vy)
+    speed = np.sqrt(vx**2 + vy**2 + 1e-6)
     acc = np.sqrt(ax**2 + ay**2 + 1e-6)
 
     yaw_rate = dyaw / (dt + eps)
     if t > 1:
-        raw_yaw_acc = np.diff(yaw_rate, axis=1) / (dt + eps)
-        yaw_acc = np.concatenate([raw_yaw_acc[:, :1], raw_yaw_acc], axis=1)
+        yaw_acc = np.gradient(yaw_rate, axis=1) / (dt + eps)
     else:
         yaw_acc = np.zeros_like(yaw_rate)
 
