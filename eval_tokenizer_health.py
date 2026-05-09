@@ -64,8 +64,12 @@ def _plot_noise_recon_cases(cases, save_path: str):
 
         clean_tokens = ",".join(str(int(v)) for v in case["tokens_clean"])
         noisy_tokens = ",".join(str(int(v)) for v in case["tokens_noisy"])
+        bucket = str(case.get("bucket", "unknown"))
+        mean_speed = float(case.get("mean_speed_mps", -1.0))
+        total_path = float(case.get("total_path_length_m", -1.0))
         ax.set_title(
-            f'sample#{case["sample_idx"]} | same_layers={case["same_layers"]}/{case["num_layers"]}\n'
+            f'sample#{case["sample_idx"]} | bucket={bucket} | same_layers={case["same_layers"]}/{case["num_layers"]}\n'
+            f"mean_speed={mean_speed:.3f}m/s, path={total_path:.3f}m\n"
             f"clean tokens: [{clean_tokens}]\n"
             f"noisy tokens: [{noisy_tokens}]",
             fontsize=9,
@@ -83,6 +87,39 @@ def _plot_noise_recon_cases(cases, save_path: str):
     return saved_paths
 
 
+def _make_vis_bucket_targets(vis_num_cases: int):
+    """分配每个速度分层要抽取的样本数量。"""
+    bucket_names = ["stationary", "low_speed", "mid_speed", "high_speed"]
+    vis_num_cases = max(0, int(vis_num_cases))
+    base = vis_num_cases // len(bucket_names)
+    rem = vis_num_cases % len(bucket_names)
+
+    targets = {name: base for name in bucket_names}
+    # 余量优先给中高速，减少可视化被静止样本主导。
+    rem_order = ["mid_speed", "high_speed", "low_speed", "stationary"]
+    for i in range(rem):
+        targets[rem_order[i]] += 1
+    return targets
+
+
+def _speed_bucket_name(
+    total_path_m: float,
+    mean_speed_mps: float,
+    stationary_path_thr_m: float,
+    stationary_speed_thr_mps: float,
+    low_speed_thr_mps: float,
+    mid_speed_thr_mps: float,
+) -> str:
+    """按轨迹运动强度分层：静止/低速/中速/高速。"""
+    if (total_path_m < stationary_path_thr_m) or (mean_speed_mps < stationary_speed_thr_mps):
+        return "stationary"
+    if mean_speed_mps < low_speed_thr_mps:
+        return "low_speed"
+    if mean_speed_mps < mid_speed_thr_mps:
+        return "mid_speed"
+    return "high_speed"
+
+
 def evaluate_tokenizer_health(
     model: TrajRVQTransformer,
     dataloader: DataLoader,
@@ -92,6 +129,11 @@ def evaluate_tokenizer_health(
     clip_limit: torch.Tensor = None,
     vis_num_cases: int = 6,
     vis_save_path: str = None,
+    vis_dt: float = 0.2,
+    vis_stationary_path_thr_m: float = 0.5,
+    vis_stationary_speed_thr_mps: float = 0.1,
+    vis_low_speed_thr_mps: float = 3.0,
+    vis_mid_speed_thr_mps: float = 8.0,
 ):
     """
     评估 Tokenizer 的健康度与拓扑稳定性。
@@ -113,6 +155,8 @@ def evaluate_tokenizer_health(
     overlap_count_per_layer = torch.zeros(num_layers).to(device)
     exact_match_all_layers = 0  # 记录所有层 Token 都完全一致的极端苛刻情况
     vis_cases = []
+    vis_bucket_targets = _make_vis_bucket_targets(vis_num_cases)
+    vis_bucket_counts = {k: 0 for k in vis_bucket_targets.keys()}
 
     print(f"开始评估 Tokenizer 健康度... (注入物理噪声: XY ±{noise_std_xy}m, Yaw ±{noise_std_yaw}rad)")
     if vis_save_path is None:
@@ -166,29 +210,87 @@ def evaluate_tokenizer_health(
             z_noisy = model.encode(x_norm_noisy)
             _, _, codes_noisy = model.rvq(z_noisy) # codes_noisy: [B, num_layers]
 
-            # 可视化样本（尽量少改动主逻辑）：展示 clean/noisy token 对应重建轨迹差异
+            # 可视化样本：按静止/低速/中速/高速分层抽样，避免前几个样本偏置。
             need = max(0, int(vis_num_cases) - len(vis_cases))
             if need > 0:
-                take = min(need, B)
-                x_recon_clean_norm = model.decode_from_codes(codes_clean[:take])
-                x_recon_noisy_norm = model.decode_from_codes(codes_noisy[:take])
-                x_recon_clean_phys = (x_recon_clean_norm * model.norm_scale * model.norm_std) + model.norm_mean
-                x_recon_noisy_phys = (x_recon_noisy_norm * model.norm_scale * model.norm_std) + model.norm_mean
+                step_dist = torch.sqrt(torch.clamp(x_phys[..., 0] ** 2 + x_phys[..., 1] ** 2, min=0.0))
+                total_path = step_dist.sum(dim=1).detach().cpu().numpy()
+                mean_speed = (step_dist.mean(dim=1) / max(float(vis_dt), 1e-6)).detach().cpu().numpy()
 
-                same_layers = (codes_clean[:take] == codes_noisy[:take]).sum(dim=1).cpu().numpy()
-                for j in range(take):
-                    vis_cases.append(
-                        {
-                            "sample_idx": int(batch_start_idx + j),
-                            "gt_phys": x_phys[j].cpu().numpy(),
-                            "recon_clean_phys": x_recon_clean_phys[j].cpu().numpy(),
-                            "recon_noisy_phys": x_recon_noisy_phys[j].cpu().numpy(),
-                            "tokens_clean": codes_clean[j].cpu().numpy(),
-                            "tokens_noisy": codes_noisy[j].cpu().numpy(),
-                            "same_layers": int(same_layers[j]),
-                            "num_layers": int(num_layers),
-                        }
+                selected_j = []
+                selected_bucket = []
+                selected_total_path = []
+                selected_mean_speed = []
+
+                # 第一阶段：优先满足每个分层的 quota。
+                for j in range(B):
+                    if len(vis_cases) + len(selected_j) >= int(vis_num_cases):
+                        break
+                    bucket = _speed_bucket_name(
+                        total_path_m=float(total_path[j]),
+                        mean_speed_mps=float(mean_speed[j]),
+                        stationary_path_thr_m=float(vis_stationary_path_thr_m),
+                        stationary_speed_thr_mps=float(vis_stationary_speed_thr_mps),
+                        low_speed_thr_mps=float(vis_low_speed_thr_mps),
+                        mid_speed_thr_mps=float(vis_mid_speed_thr_mps),
                     )
+                    if vis_bucket_counts[bucket] >= vis_bucket_targets[bucket]:
+                        continue
+                    selected_j.append(j)
+                    selected_bucket.append(bucket)
+                    selected_total_path.append(float(total_path[j]))
+                    selected_mean_speed.append(float(mean_speed[j]))
+                    vis_bucket_counts[bucket] += 1
+
+                # 第二阶段：若某些分层样本不足，剩余额度用本 batch 其它样本补齐。
+                if len(vis_cases) + len(selected_j) < int(vis_num_cases):
+                    selected_set = set(selected_j)
+                    for j in range(B):
+                        if len(vis_cases) + len(selected_j) >= int(vis_num_cases):
+                            break
+                        if j in selected_set:
+                            continue
+                        bucket = _speed_bucket_name(
+                            total_path_m=float(total_path[j]),
+                            mean_speed_mps=float(mean_speed[j]),
+                            stationary_path_thr_m=float(vis_stationary_path_thr_m),
+                            stationary_speed_thr_mps=float(vis_stationary_speed_thr_mps),
+                            low_speed_thr_mps=float(vis_low_speed_thr_mps),
+                            mid_speed_thr_mps=float(vis_mid_speed_thr_mps),
+                        )
+                        selected_j.append(j)
+                        selected_bucket.append(bucket)
+                        selected_total_path.append(float(total_path[j]))
+                        selected_mean_speed.append(float(mean_speed[j]))
+                        vis_bucket_counts[bucket] += 1
+                        selected_set.add(j)
+
+                if len(selected_j) > 0:
+                    sel_tensor = torch.as_tensor(selected_j, device=x_norm.device, dtype=torch.long)
+                    clean_sel = codes_clean[sel_tensor]
+                    noisy_sel = codes_noisy[sel_tensor]
+                    x_recon_clean_norm = model.decode_from_codes(clean_sel)
+                    x_recon_noisy_norm = model.decode_from_codes(noisy_sel)
+                    x_recon_clean_phys = (x_recon_clean_norm * model.norm_scale * model.norm_std) + model.norm_mean
+                    x_recon_noisy_phys = (x_recon_noisy_norm * model.norm_scale * model.norm_std) + model.norm_mean
+
+                    same_layers = (clean_sel == noisy_sel).sum(dim=1).detach().cpu().numpy()
+                    for k, j in enumerate(selected_j):
+                        vis_cases.append(
+                            {
+                                "sample_idx": int(batch_start_idx + j),
+                                "bucket": str(selected_bucket[k]),
+                                "mean_speed_mps": float(selected_mean_speed[k]),
+                                "total_path_length_m": float(selected_total_path[k]),
+                                "gt_phys": x_phys[j].detach().cpu().numpy(),
+                                "recon_clean_phys": x_recon_clean_phys[k].detach().cpu().numpy(),
+                                "recon_noisy_phys": x_recon_noisy_phys[k].detach().cpu().numpy(),
+                                "tokens_clean": clean_sel[k].detach().cpu().numpy(),
+                                "tokens_noisy": noisy_sel[k].detach().cpu().numpy(),
+                                "same_layers": int(same_layers[k]),
+                                "num_layers": int(num_layers),
+                            }
+                        )
 
             # ==========================================
             # 4. 计算 Overlap Rate (重叠率)
@@ -268,6 +370,9 @@ def evaluate_tokenizer_health(
     # 画在一个画布上：clean/noisy 重建 + 各自 token 激活值
     saved_paths = _plot_noise_recon_cases(vis_cases, vis_save_path)
     if len(saved_paths) > 0:
+        print("可视化分层抽样统计:")
+        for k in ["stationary", "low_speed", "mid_speed", "high_speed"]:
+            print(f"  - {k}: {int(vis_bucket_counts.get(k, 0))}/{int(vis_bucket_targets.get(k, 0))}")
         print(f"已保存可视化对比图(每样本一张): {os.path.dirname(saved_paths[0])}")
         print(f"图像数量: {len(saved_paths)}，文件前缀: {os.path.basename(vis_save_path)}")
     print("="*50 + "\n")
