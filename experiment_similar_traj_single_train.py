@@ -1,7 +1,4 @@
 import argparse
-import csv
-import hashlib
-import json
 import os
 import pickle
 import time
@@ -13,6 +10,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
+try:
+    import matplotlib.pyplot as plt
+except Exception:  # pragma: no cover
+    plt = None
 
 try:
     from train_tfm import (
@@ -29,7 +30,21 @@ try:
         scenario_metrics,
     )
     from eval_tokenizer_health import evaluate_tokenizer_health
-    from utils import load_sampled_datas, preprocess_and_save_norm_params
+    from utils import (
+        load_sampled_datas,
+        preprocess_and_save_norm_params,
+        integrate_to_global,
+        percentiles as _percentiles,
+        write_json as _write_json,
+        write_csv as _write_csv,
+    )
+    from grouping_pipeline import (
+        build_grouping_cache_key,
+        try_load_grouping_from_cache,
+        save_grouping_cache,
+        compute_motion_stats,
+        find_representative_groups,
+    )
 except ImportError:
     from rvq_transformer_vehdyn.train_tfm import (
         TrajRVQTransformer,
@@ -45,7 +60,21 @@ except ImportError:
         scenario_metrics,
     )
     from rvq_transformer_vehdyn.eval_tokenizer_health import evaluate_tokenizer_health
-    from rvq_transformer_vehdyn.utils import load_sampled_datas, preprocess_and_save_norm_params
+    from rvq_transformer_vehdyn.utils import (
+        load_sampled_datas,
+        preprocess_and_save_norm_params,
+        integrate_to_global,
+        percentiles as _percentiles,
+        write_json as _write_json,
+        write_csv as _write_csv,
+    )
+    from rvq_transformer_vehdyn.grouping_pipeline import (
+        build_grouping_cache_key,
+        try_load_grouping_from_cache,
+        save_grouping_cache,
+        compute_motion_stats,
+        find_representative_groups,
+    )
 
 
 def _set_seed(seed: int) -> None:
@@ -55,574 +84,6 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _to_py(obj):
-    """递归转成 Python 原生类型，确保 json.dump 不报错。"""
-    if isinstance(obj, dict):
-        return {str(k): _to_py(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_to_py(v) for v in obj]
-    if isinstance(obj, tuple):
-        return [_to_py(v) for v in obj]
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, (np.float16, np.float32, np.float64)):
-        return float(obj)
-    if isinstance(obj, (np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
-        return int(obj)
-    if isinstance(obj, torch.Tensor):
-        return _to_py(obj.detach().cpu().numpy())
-    return obj
-
-
-def _percentiles(arr: np.ndarray) -> Dict[str, float]:
-    if arr.size == 0:
-        return {k: 0.0 for k in ["p0", "p25", "p50", "p75", "p95", "p99", "max"]}
-    q = np.percentile(arr, [0, 25, 50, 75, 95, 99])
-    return {
-        "p0": float(q[0]),
-        "p25": float(q[1]),
-        "p50": float(q[2]),
-        "p75": float(q[3]),
-        "p95": float(q[4]),
-        "p99": float(q[5]),
-        "max": float(np.max(arr)),
-    }
-
-
-def _write_json(path: str, data: Dict[str, object]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(_to_py(data), f, indent=2)
-
-
-def _write_csv(rows: List[Dict[str, object]], path: str) -> None:
-    if not rows:
-        return
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fieldnames = list(rows[0].keys())
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def _safe_float_str(v: float) -> str:
-    return f"{float(v):.8f}"
-
-
-def _build_grouping_cache_key(
-    *,
-    data_path: Optional[str],
-    data_type: str,
-    n_total: int,
-    num_steps: int,
-    requested_num_groups: int,
-    grouping_method: str,
-    group_feature: str,
-    shape_downsample_steps: int,
-    feature_xy_weight: float,
-    feature_yaw_weight: float,
-    dt: float,
-    kmeans_batch_size: int,
-    kmeans_max_iter: int,
-    kmeans_random_state: int,
-    seed: int,
-) -> str:
-    """
-    为分组结果生成稳定 cache key。
-    不依赖大数组哈希，避免额外开销；使用数据路径 + 关键参数 + 数据规模组合。
-    """
-    payload = {
-        "data_path": str(data_path),
-        "data_type": str(data_type),
-        "n_total": int(n_total),
-        "num_steps": int(num_steps),
-        "requested_num_groups": int(requested_num_groups),
-        "grouping_method": str(grouping_method),
-        "group_feature": str(group_feature),
-        "shape_downsample_steps": int(shape_downsample_steps),
-        "feature_xy_weight": _safe_float_str(feature_xy_weight),
-        "feature_yaw_weight": _safe_float_str(feature_yaw_weight),
-        "dt": _safe_float_str(dt),
-        "kmeans_batch_size": int(kmeans_batch_size),
-        "kmeans_max_iter": int(kmeans_max_iter),
-        "kmeans_random_state": int(kmeans_random_state),
-        "seed": int(seed),
-    }
-    s = json.dumps(payload, sort_keys=True, ensure_ascii=True)
-    return hashlib.md5(s.encode("utf-8")).hexdigest()
-
-
-def _try_load_grouping_from_cache(
-    cache_dir: str,
-    n_total: int,
-) -> Optional[Dict[str, object]]:
-    rep_path = os.path.join(cache_dir, "representative_indices.npy")
-    gid_path = os.path.join(cache_dir, "group_id_per_sample.npy")
-    gsz_path = os.path.join(cache_dir, "group_sizes.npy")
-    repd_path = os.path.join(cache_dir, "representative_distance_to_center.npy")
-    meta_path = os.path.join(cache_dir, "group_cache_meta.json")
-    if not (os.path.exists(rep_path) and os.path.exists(gid_path) and os.path.exists(gsz_path)):
-        return None
-
-    try:
-        representative_indices = np.load(rep_path).astype(np.int64)
-        group_id_per_sample = np.load(gid_path).astype(np.int32)
-        group_sizes = np.load(gsz_path).astype(np.int64)
-        if os.path.exists(repd_path):
-            rep_dist = np.load(repd_path).astype(np.float32)
-        else:
-            rep_dist = np.zeros((representative_indices.shape[0],), dtype=np.float32)
-    except Exception:
-        return None
-
-    if group_id_per_sample.shape[0] != int(n_total):
-        return None
-    if representative_indices.shape[0] != group_sizes.shape[0]:
-        return None
-
-    actual_num_groups = int(group_sizes.shape[0])
-    if actual_num_groups <= 0:
-        return None
-
-    group_to_indices = _build_group_to_indices(group_id_per_sample, actual_num_groups)
-
-    grouping_method_used = "cache"
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-            grouping_method_used = str(meta.get("grouping_method_used", grouping_method_used))
-        except Exception:
-            pass
-
-    return {
-        "group_id_per_sample": group_id_per_sample,
-        "representative_indices": representative_indices,
-        "group_sizes": group_sizes,
-        "representative_distance_to_center": rep_dist,
-        "group_to_indices": group_to_indices,
-        "actual_num_groups": actual_num_groups,
-        "grouping_method_used": grouping_method_used,
-    }
-
-
-def _save_grouping_cache(
-    cache_dir: str,
-    grouping: Dict[str, object],
-    meta: Dict[str, object],
-) -> None:
-    os.makedirs(cache_dir, exist_ok=True)
-    np.save(os.path.join(cache_dir, "representative_indices.npy"), np.asarray(grouping["representative_indices"], dtype=np.int64))
-    np.save(os.path.join(cache_dir, "group_id_per_sample.npy"), np.asarray(grouping["group_id_per_sample"], dtype=np.int32))
-    np.save(os.path.join(cache_dir, "group_sizes.npy"), np.asarray(grouping["group_sizes"], dtype=np.int64))
-    np.save(
-        os.path.join(cache_dir, "representative_distance_to_center.npy"),
-        np.asarray(grouping["representative_distance_to_center"], dtype=np.float32),
-    )
-    _write_json(os.path.join(cache_dir, "group_cache_meta.json"), meta)
-
-
-def compute_motion_stats(trajs: np.ndarray, dt: float) -> Dict[str, np.ndarray]:
-    """统计运动学分布，只用于分析与分组，不用于过滤。"""
-    x = np.asarray(trajs, dtype=np.float32)
-    dx = x[..., 0]
-    dy = x[..., 1]
-    dyaw = x[..., 2]
-
-    step_dist = np.sqrt(dx * dx + dy * dy)
-    total_path_length = np.sum(step_dist, axis=1)
-    mean_speed = np.mean(step_dist, axis=1) / max(float(dt), 1e-6)
-    max_speed = np.max(step_dist, axis=1) / max(float(dt), 1e-6)
-    abs_yaw_sum = np.sum(np.abs(dyaw), axis=1)
-    final_yaw_abs = np.abs(np.sum(dyaw, axis=1))
-    lateral_abs_sum = np.sum(np.abs(dy), axis=1)
-
-    stationary_like = (total_path_length < 0.5) | (mean_speed < 0.1)
-
-    return {
-        "total_path_length": total_path_length.astype(np.float32),
-        "mean_speed": mean_speed.astype(np.float32),
-        "max_speed": max_speed.astype(np.float32),
-        "abs_yaw_sum": abs_yaw_sum.astype(np.float32),
-        "final_yaw_abs": final_yaw_abs.astype(np.float32),
-        "lateral_abs_sum": lateral_abs_sum.astype(np.float32),
-        "stationary_like": stationary_like.astype(bool),
-    }
-
-
-def _uniform_downsample_indices(num_steps: int, target_steps: int) -> np.ndarray:
-    if target_steps <= 1:
-        return np.asarray([0], dtype=np.int64)
-    if target_steps >= num_steps:
-        return np.arange(num_steps, dtype=np.int64)
-    return np.linspace(0, num_steps - 1, target_steps).round().astype(np.int64)
-
-
-def _robust_scale(feature: np.ndarray) -> np.ndarray:
-    med = np.median(feature, axis=0, keepdims=True)
-    q75 = np.percentile(feature, 75, axis=0, keepdims=True)
-    q25 = np.percentile(feature, 25, axis=0, keepdims=True)
-    iqr = q75 - q25
-    return (feature - med) / (iqr + 1e-6)
-
-
-def build_group_features(
-    trajs: np.ndarray,
-    dt: float,
-    group_feature: str,
-    shape_downsample_steps: int,
-    xy_weight: float,
-    yaw_weight: float,
-    motion_stats: Optional[Dict[str, np.ndarray]] = None,
-) -> np.ndarray:
-    """构造分组特征：kinematic / shape / kinematic_plus_shape。"""
-    x = np.asarray(trajs, dtype=np.float32)
-    n, t, _ = x.shape
-
-    if motion_stats is None:
-        motion_stats = compute_motion_stats(x, dt=dt)
-
-    dx = x[..., 0]
-    dy = x[..., 1]
-    dyaw = x[..., 2]
-
-    mean_abs_dx = np.mean(np.abs(dx), axis=1)
-    mean_abs_dy = np.mean(np.abs(dy), axis=1)
-    mean_abs_dyaw = np.mean(np.abs(dyaw), axis=1)
-    std_dx = np.std(dx, axis=1)
-    std_dy = np.std(dy, axis=1)
-    std_dyaw = np.std(dyaw, axis=1)
-
-    kin = np.stack(
-        [
-            motion_stats["total_path_length"],
-            motion_stats["mean_speed"],
-            motion_stats["max_speed"],
-            motion_stats["abs_yaw_sum"],
-            motion_stats["final_yaw_abs"],
-            motion_stats["lateral_abs_sum"],
-            mean_abs_dx,
-            mean_abs_dy,
-            mean_abs_dyaw,
-            std_dx,
-            std_dy,
-            std_dyaw,
-        ],
-        axis=1,
-    ).astype(np.float32)
-
-    # 正值统计做 log1p，缓解长尾。
-    kin = np.log1p(np.maximum(kin, 0.0))
-    kin = _robust_scale(kin).astype(np.float32)
-
-    feat_parts: List[np.ndarray] = []
-    if group_feature in ("kinematic", "kinematic_plus_shape"):
-        feat_parts.append(kin)
-
-    if group_feature in ("shape", "kinematic_plus_shape"):
-        ds_idx = _uniform_downsample_indices(t, max(1, int(shape_downsample_steps)))
-        shape = x[:, ds_idx, :].copy()
-        shape[..., 0] *= float(xy_weight)
-        shape[..., 1] *= float(xy_weight)
-        shape[..., 2] *= float(yaw_weight)
-        shape = shape.reshape(n, -1).astype(np.float32)
-        feat_parts.append(shape)
-
-    if not feat_parts:
-        raise ValueError(f"Unsupported group_feature: {group_feature}")
-
-    feat = np.concatenate(feat_parts, axis=1).astype(np.float32)
-    mean = feat.mean(axis=0, keepdims=True)
-    std = feat.std(axis=0, keepdims=True)
-    feat = (feat - mean) / (std + 1e-6)
-    feat = feat.astype(np.float32)
-
-    print(f"Grouping feature shape: {feat.shape}")
-    return feat
-
-
-def _build_group_to_indices(group_id_per_sample: np.ndarray, num_groups: int) -> List[np.ndarray]:
-    order = np.argsort(group_id_per_sample, kind="mergesort")
-    labels_sorted = group_id_per_sample[order]
-    group_to_indices: List[np.ndarray] = [np.zeros((0,), dtype=np.int64) for _ in range(num_groups)]
-    if order.size == 0:
-        return group_to_indices
-
-    boundaries = np.flatnonzero(np.diff(labels_sorted)) + 1
-    starts = np.concatenate([[0], boundaries])
-    ends = np.concatenate([boundaries, [order.size]])
-    for s, e in zip(starts.tolist(), ends.tolist()):
-        gid = int(labels_sorted[s])
-        group_to_indices[gid] = order[s:e].astype(np.int64)
-    return group_to_indices
-
-
-def _compute_representatives_from_groups(
-    features: np.ndarray,
-    group_to_indices: List[np.ndarray],
-) -> Tuple[np.ndarray, np.ndarray]:
-    reps = np.zeros((len(group_to_indices),), dtype=np.int64)
-    rep_dist = np.zeros((len(group_to_indices),), dtype=np.float32)
-    for gid, idxs in enumerate(group_to_indices):
-        if idxs.size == 0:
-            reps[gid] = 0
-            rep_dist[gid] = 0.0
-            continue
-        feat = features[idxs]
-        center = feat.mean(axis=0, keepdims=True)
-        d2 = np.sum((feat - center) ** 2, axis=1)
-        j = int(np.argmin(d2))
-        reps[gid] = int(idxs[j])
-        rep_dist[gid] = float(np.sqrt(max(float(d2[j]), 0.0)))
-    return reps, rep_dist
-
-
-def _split_groups_to_target(
-    groups: List[np.ndarray],
-    features: np.ndarray,
-    num_groups: int,
-    seed: int,
-) -> List[np.ndarray]:
-    """将初始分组数调整到接近期望组数。"""
-    n = int(sum(int(g.size) for g in groups))
-    target = int(max(1, min(num_groups, n)))
-    if len(groups) == target:
-        return groups
-
-    # 初始组过多：做平衡合并。
-    if len(groups) > target:
-        groups_sorted = sorted(groups, key=lambda g: int(g.size), reverse=True)
-        buckets: List[List[np.ndarray]] = [[] for _ in range(target)]
-        bucket_sizes = np.zeros((target,), dtype=np.int64)
-        for g in groups_sorted:
-            bid = int(np.argmin(bucket_sizes))
-            buckets[bid].append(g)
-            bucket_sizes[bid] += int(g.size)
-        merged: List[np.ndarray] = []
-        for bucket in buckets:
-            merged.append(np.concatenate(bucket, axis=0).astype(np.int64) if bucket else np.zeros((0,), dtype=np.int64))
-        return merged
-
-    # 初始组不足：按组内特征一维排序后切块细分。
-    avg_target_size = float(n) / float(target)
-    base_split = []
-    split_remainder = []
-    for g in groups:
-        desired = float(g.size) / max(avg_target_size, 1e-6)
-        k = int(np.floor(desired))
-        k = max(1, min(int(g.size), k))
-        base_split.append(k)
-        split_remainder.append(desired - np.floor(desired))
-
-    current = int(np.sum(base_split))
-    order_add = np.argsort(-np.asarray(split_remainder))
-    order_sub = np.argsort(np.asarray(split_remainder))
-
-    ptr = 0
-    while current < target and ptr < len(order_add):
-        i = int(order_add[ptr])
-        if base_split[i] < int(groups[i].size):
-            base_split[i] += 1
-            current += 1
-        else:
-            ptr += 1
-
-    ptr = 0
-    while current > target and ptr < len(order_sub):
-        i = int(order_sub[ptr])
-        if base_split[i] > 1:
-            base_split[i] -= 1
-            current -= 1
-        else:
-            ptr += 1
-
-    rng = np.random.default_rng(seed)
-    out: List[np.ndarray] = []
-    for i, g in enumerate(groups):
-        k = int(max(1, min(base_split[i], int(g.size))))
-        if k == 1:
-            out.append(g.astype(np.int64))
-            continue
-        feat = features[g]
-        var = np.var(feat, axis=0)
-        dim = int(np.argmax(var))
-        # 若该维完全无方差，退化成随机投影，避免无法切分。
-        if float(var[dim]) < 1e-12:
-            proj = rng.standard_normal((feat.shape[0],), dtype=np.float32)
-        else:
-            proj = feat[:, dim]
-        order = np.argsort(proj)
-        splits = np.array_split(order, k)
-        for s in splits:
-            if s.size > 0:
-                out.append(g[s].astype(np.int64))
-
-    if len(out) > target:
-        out = sorted(out, key=lambda a: int(a.size), reverse=True)[:target]
-    elif len(out) < target:
-        # 极端情况下补齐空组前，尽量再次拆大组。
-        out = sorted(out, key=lambda a: int(a.size), reverse=True)
-        i = 0
-        while len(out) < target and i < len(out):
-            g = out[i]
-            if g.size >= 2:
-                half = g.size // 2
-                out[i] = g[:half]
-                out.append(g[half:])
-            else:
-                i += 1
-
-    return out
-
-
-def find_representative_groups_kinematic_bins(
-    trajs: np.ndarray,
-    features: np.ndarray,
-    motion_stats: Dict[str, np.ndarray],
-    num_groups: int,
-    seed: int,
-) -> Dict[str, object]:
-    """运动学分箱分组（fallback）：先分箱，再按特征细分/合并到目标组数。"""
-    n = int(trajs.shape[0])
-    target = int(max(1, min(num_groups, n)))
-
-    stats_for_bins = [
-        motion_stats["mean_speed"],
-        motion_stats["abs_yaw_sum"],
-        motion_stats["total_path_length"],
-        motion_stats["lateral_abs_sum"],
-    ]
-
-    binned_cols = []
-    for arr in stats_for_bins:
-        arr = np.asarray(arr, dtype=np.float32)
-        q = np.percentile(arr, np.linspace(0, 100, 11))
-        q = np.unique(q)
-        if q.size <= 2:
-            bins = np.zeros_like(arr, dtype=np.int32)
-        else:
-            bins = np.searchsorted(q[1:-1], arr, side="right").astype(np.int32)
-        binned_cols.append(bins)
-
-    b0, b1, b2, b3 = binned_cols
-    key = b0 + 16 * b1 + 256 * b2 + 4096 * b3
-
-    order = np.argsort(key, kind="mergesort")
-    key_sorted = key[order]
-    boundaries = np.flatnonzero(np.diff(key_sorted)) + 1
-    starts = np.concatenate([[0], boundaries])
-    ends = np.concatenate([boundaries, [order.size]])
-
-    groups: List[np.ndarray] = []
-    for s, e in zip(starts.tolist(), ends.tolist()):
-        groups.append(order[s:e].astype(np.int64))
-
-    groups = _split_groups_to_target(groups, features=features, num_groups=target, seed=seed)
-
-    group_id = np.zeros((n,), dtype=np.int32)
-    for gid, idxs in enumerate(groups):
-        group_id[idxs] = int(gid)
-
-    group_sizes = np.asarray([int(g.size) for g in groups], dtype=np.int64)
-    reps, rep_dist = _compute_representatives_from_groups(features, groups)
-
-    return {
-        "group_id_per_sample": group_id,
-        "representative_indices": reps,
-        "group_sizes": group_sizes,
-        "representative_distance_to_center": rep_dist,
-        "group_to_indices": groups,
-        "actual_num_groups": int(len(groups)),
-        "grouping_method_used": "kinematic_bins",
-    }
-
-
-def find_representative_groups_minibatch_kmeans(
-    trajs: np.ndarray,
-    features: np.ndarray,
-    num_groups: int,
-    batch_size: int,
-    max_iter: int,
-    seed: int,
-    motion_stats: Dict[str, np.ndarray],
-) -> Dict[str, object]:
-    """MiniBatchKMeans 分组；若 sklearn 不可用则自动回退 kinematic_bins。"""
-    n = int(trajs.shape[0])
-    target = int(max(1, min(num_groups, n)))
-
-    try:
-        from sklearn.cluster import MiniBatchKMeans
-    except Exception:
-        print("[warning] sklearn 不可用，fallback 到 kinematic_bins 分组。")
-        return find_representative_groups_kinematic_bins(
-            trajs=trajs,
-            features=features,
-            motion_stats=motion_stats,
-            num_groups=target,
-            seed=seed,
-        )
-
-    # sklearn 版本兼容：
-    # 有些版本在构造时接受 n_init='auto'，但 fit 时才报类型错误。
-    # 因此这里在 fit 阶段也做一次兜底回退。
-    def _build_kmeans(n_init_value):
-        return MiniBatchKMeans(
-            n_clusters=target,
-            batch_size=max(256, int(batch_size)),
-            max_iter=max(10, int(max_iter)),
-            random_state=seed,
-            n_init=n_init_value,
-            reassignment_ratio=0.01,
-            verbose=0,
-        )
-
-    kmeans = _build_kmeans("auto")
-    try:
-        labels_raw = kmeans.fit_predict(features).astype(np.int32)
-        centers_raw = np.asarray(kmeans.cluster_centers_, dtype=np.float32)
-    except Exception:
-        # 兼容老 sklearn：有的版本在 __init__ 不报错，但 fit 时才因 n_init='auto' 失败。
-        # 只要当前 n_init 是字符串，就回退到整数 n_init 再试一次。
-        if not isinstance(getattr(kmeans, "n_init", None), str):
-            raise
-        print("[warning] sklearn 版本不支持 n_init='auto'，自动回退到 n_init=3。")
-        kmeans = _build_kmeans(3)
-        labels_raw = kmeans.fit_predict(features).astype(np.int32)
-        centers_raw = np.asarray(kmeans.cluster_centers_, dtype=np.float32)
-
-    unique_labels, group_id_per_sample = np.unique(labels_raw, return_inverse=True)
-    centers = centers_raw[unique_labels]
-    num_actual = int(unique_labels.shape[0])
-
-    group_to_indices = _build_group_to_indices(group_id_per_sample.astype(np.int32), num_actual)
-
-    reps = np.zeros((num_actual,), dtype=np.int64)
-    rep_dist = np.zeros((num_actual,), dtype=np.float32)
-    group_sizes = np.zeros((num_actual,), dtype=np.int64)
-
-    for gid, idxs in enumerate(group_to_indices):
-        group_sizes[gid] = int(idxs.size)
-        if idxs.size == 0:
-            reps[gid] = 0
-            rep_dist[gid] = 0.0
-            continue
-        feat = features[idxs]
-        c = centers[gid]
-        d2 = np.sum((feat - c[None, :]) ** 2, axis=1)
-        j = int(np.argmin(d2))
-        reps[gid] = int(idxs[j])
-        rep_dist[gid] = float(np.sqrt(max(float(d2[j]), 0.0)))
-
-    return {
-        "group_id_per_sample": group_id_per_sample.astype(np.int32),
-        "representative_indices": reps,
-        "group_sizes": group_sizes,
-        "representative_distance_to_center": rep_dist,
-        "group_to_indices": group_to_indices,
-        "actual_num_groups": num_actual,
-        "grouping_method_used": "minibatch_kmeans",
-    }
 
 
 def get_primary_codebook_weight(model: TrajRVQTransformer) -> Optional[torch.Tensor]:
@@ -1420,6 +881,98 @@ def evaluate_selected_group_or(
     }
 
 
+def save_random_group_visualizations(
+    trajs: np.ndarray,
+    representative_indices: np.ndarray,
+    group_to_indices: List[np.ndarray],
+    save_dir: str,
+    num_groups: int,
+    max_members_per_group: int,
+    seed: int,
+) -> Dict[str, object]:
+    """随机抽取若干 group 可视化，检查分组质量。"""
+    if plt is None:
+        print("[warning] matplotlib 不可用，跳过 group 可视化。")
+        return {"enabled": False, "reason": "matplotlib_not_available", "saved_count": 0, "vis_dir": save_dir}
+
+    os.makedirs(save_dir, exist_ok=True)
+    group_sizes = np.asarray([idxs.size for idxs in group_to_indices], dtype=np.int64)
+    valid = np.where(group_sizes >= 2)[0]
+    if valid.size == 0 or int(num_groups) <= 0:
+        return {"enabled": False, "reason": "no_valid_groups", "saved_count": 0, "vis_dir": save_dir}
+
+    rng = np.random.default_rng(seed)
+    take_g = min(int(num_groups), int(valid.size))
+    chosen_gids = rng.choice(valid, size=take_g, replace=False)
+    chosen_gids = np.sort(chosen_gids.astype(np.int64))
+
+    rows: List[Dict[str, object]] = []
+    saved_count = 0
+    for k, gid in enumerate(chosen_gids.tolist(), start=1):
+        members = group_to_indices[int(gid)]
+        anchor_idx = int(representative_indices[int(gid)])
+
+        # 每组最多画 max_members_per_group 条，且包含 representative。
+        if members.size > int(max_members_per_group):
+            others = members[members != anchor_idx]
+            take_other = max(0, int(max_members_per_group) - 1)
+            if take_other > 0 and others.size > 0:
+                chosen_other = rng.choice(others, size=min(take_other, int(others.size)), replace=False)
+                vis_indices = np.concatenate([[anchor_idx], chosen_other.astype(np.int64)], axis=0)
+            else:
+                vis_indices = np.asarray([anchor_idx], dtype=np.int64)
+        else:
+            vis_indices = members.astype(np.int64)
+            if anchor_idx not in vis_indices:
+                vis_indices = np.concatenate([[anchor_idx], vis_indices], axis=0)
+        vis_indices = np.unique(vis_indices).astype(np.int64)
+
+        clips = np.asarray(trajs[vis_indices], dtype=np.float32)
+        xy_global = integrate_to_global(clips)
+
+        fig = plt.figure(figsize=(7, 6), dpi=140)
+        ax = fig.add_subplot(111)
+        for i in range(xy_global.shape[0]):
+            x = xy_global[i, :, 0]
+            y = xy_global[i, :, 1]
+            idx_global = int(vis_indices[i])
+            if idx_global == anchor_idx:
+                ax.plot(x, y, "-", linewidth=2.2, label=f"anchor:{idx_global}")
+                ax.scatter([x[0]], [y[0]], s=24, marker="o")
+            else:
+                ax.plot(x, y, "-", linewidth=1.0, alpha=0.75)
+
+        ax.set_title(f"group_{k:02d}_gid{gid}_size{int(members.size)}")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
+        ax.grid(alpha=0.3)
+        ax.axis("equal")
+        ax.legend(loc="best", fontsize=8)
+
+        fname = f"group_{k:02d}_gid{gid}_size{int(members.size)}.png"
+        fpath = os.path.join(save_dir, fname)
+        fig.tight_layout()
+        fig.savefig(fpath)
+        plt.close(fig)
+
+        saved_count += 1
+        rows.append(
+            {
+                "order": int(k),
+                "group_id": int(gid),
+                "group_size": int(members.size),
+                "anchor_idx": int(anchor_idx),
+                "num_members_visualized": int(vis_indices.size),
+                "figure_path": fpath,
+                "sample_indices": ",".join([str(int(v)) for v in vis_indices.tolist()]),
+            }
+        )
+
+    _write_csv(rows, os.path.join(save_dir, "group_visualization_samples.csv"))
+    print(f"[group-vis] saved {saved_count} figures to: {save_dir}")
+    return {"enabled": True, "saved_count": int(saved_count), "vis_dir": save_dir}
+
+
 def _print_dataset_summary(stats: Dict[str, np.ndarray], num_steps: int) -> None:
     raw_count = int(stats["total_path_length"].shape[0])
     stationary_like_count = int(np.sum(stats["stationary_like"]))
@@ -1436,6 +989,7 @@ def _print_dataset_summary(stats: Dict[str, np.ndarray], num_steps: int) -> None
 
 def _print_grouping_summary(
     grouping_method: str,
+    grouping_stage: str,
     group_feature: str,
     requested_num_groups: int,
     actual_num_groups: int,
@@ -1445,6 +999,7 @@ def _print_grouping_summary(
     p = _percentiles(group_sizes.astype(np.float32))
     print("Grouping Summary")
     print(f"grouping_method: {grouping_method}")
+    print(f"grouping_stage: {grouping_stage}")
     print(f"group_feature: {group_feature}")
     print(f"requested_num_groups: {requested_num_groups}")
     print(f"actual_num_groups: {actual_num_groups}")
@@ -1492,6 +1047,13 @@ def main() -> None:
         choices=["minibatch_kmeans", "kinematic_bins"],
     )
     parser.add_argument(
+        "--grouping-stage",
+        type=str,
+        default="scenario_first",
+        choices=["scenario_first", "global"],
+        help="scenario_first: 先按场景切分再场景内分组；global: 全量直接分组。",
+    )
+    parser.add_argument(
         "--group-feature",
         type=str,
         default="kinematic_plus_shape",
@@ -1503,6 +1065,7 @@ def main() -> None:
 
     parser.add_argument("--kmeans-batch-size", type=int, default=8192)
     parser.add_argument("--kmeans-max-iter", type=int, default=100)
+    parser.add_argument("--kmeans-n-init", type=int, default=1) # 为了结果稳定，建议设置较大值（如 10 或 20），但会增加计算成本。默认值 1 是为了快速测试。
     parser.add_argument("--kmeans-random-state", type=int, default=42)
 
     parser.add_argument("--full-train-batch-size", type=int, default=4096)
@@ -1547,6 +1110,8 @@ def main() -> None:
 
     parser.add_argument("--group-size", type=int, default=6)
     parser.add_argument("--report-selected-group-or", action="store_true")
+    parser.add_argument("--num-group-visualizations", type=int, default=0)
+    parser.add_argument("--max-members-per-group-vis", type=int, default=12)
 
     parser.add_argument("--save-root", type=str, default="./work_dirs/tokenizer/similar_single_train")
     parser.add_argument("--output-dir", type=str, default=None)
@@ -1579,13 +1144,14 @@ def main() -> None:
     # 分组 cache：优先读 output_dir 下已有结果；其次读全局 grouping_cache。
     cache_key = str(args.grouping_cache_key).strip()
     if not cache_key:
-        cache_key = _build_grouping_cache_key(
+        cache_key = build_grouping_cache_key(
             data_path=args.data_path,
             data_type=args.data_type,
             n_total=n_total,
             num_steps=int(trajs.shape[1]),
             requested_num_groups=requested_num_groups,
             grouping_method=args.grouping_method,
+            grouping_stage=args.grouping_stage,
             group_feature=args.group_feature,
             shape_downsample_steps=int(args.shape_downsample_steps),
             feature_xy_weight=float(args.feature_xy_weight),
@@ -1593,6 +1159,7 @@ def main() -> None:
             dt=float(args.dt),
             kmeans_batch_size=int(args.kmeans_batch_size),
             kmeans_max_iter=int(args.kmeans_max_iter),
+            kmeans_n_init=int(args.kmeans_n_init),
             kmeans_random_state=int(args.kmeans_random_state),
             seed=int(args.seed),
         )
@@ -1601,50 +1168,42 @@ def main() -> None:
     grouping_cache_dir = os.path.join(grouping_cache_root, cache_key)
 
     if not args.disable_grouping_cache:
-        grouping = _try_load_grouping_from_cache(output_dir, n_total=n_total)
+        grouping = try_load_grouping_from_cache(output_dir, n_total=n_total)
         if grouping is not None:
             grouping_loaded_from_cache = True
             print(f"[cache] Loaded grouping from output_dir: {output_dir}")
         else:
-            grouping = _try_load_grouping_from_cache(grouping_cache_dir, n_total=n_total)
+            grouping = try_load_grouping_from_cache(grouping_cache_dir, n_total=n_total)
             if grouping is not None:
                 grouping_loaded_from_cache = True
                 print(f"[cache] Loaded grouping from cache_dir: {grouping_cache_dir}")
 
     if grouping is None:
-        features = build_group_features(
+        # 分组核心流程：按配置选择全局分组或“先场景后分组”。
+        grouping = find_representative_groups(
             trajs=trajs,
             dt=float(args.dt),
+            num_groups=requested_num_groups,
+            grouping_method=args.grouping_method,
+            grouping_stage=args.grouping_stage,
             group_feature=args.group_feature,
             shape_downsample_steps=int(args.shape_downsample_steps),
-            xy_weight=float(args.feature_xy_weight),
-            yaw_weight=float(args.feature_yaw_weight),
+            feature_xy_weight=float(args.feature_xy_weight),
+            feature_yaw_weight=float(args.feature_yaw_weight),
+            kmeans_batch_size=int(args.kmeans_batch_size),
+            kmeans_max_iter=int(args.kmeans_max_iter),
+            kmeans_n_init=int(args.kmeans_n_init),
+            kmeans_random_state=int(args.kmeans_random_state),
+            seed=int(args.seed),
             motion_stats=motion_stats,
         )
-
-        if args.grouping_method == "minibatch_kmeans":
-            grouping = find_representative_groups_minibatch_kmeans(
-                trajs=trajs,
-                features=features,
-                num_groups=requested_num_groups,
-                batch_size=int(args.kmeans_batch_size),
-                max_iter=int(args.kmeans_max_iter),
-                seed=int(args.kmeans_random_state),
-                motion_stats=motion_stats,
-            )
-        else:
-            grouping = find_representative_groups_kinematic_bins(
-                trajs=trajs,
-                features=features,
-                motion_stats=motion_stats,
-                num_groups=requested_num_groups,
-                seed=int(args.seed),
-            )
 
         if not args.disable_grouping_cache:
             cache_meta = {
                 "grouping_method_used": grouping["grouping_method_used"],
+                "grouping_stage_used": grouping.get("grouping_stage_used", args.grouping_stage),
                 "grouping_method_requested": args.grouping_method,
+                "grouping_stage_requested": args.grouping_stage,
                 "group_feature": args.group_feature,
                 "cache_key": cache_key,
                 "raw_count": int(n_total),
@@ -1652,15 +1211,17 @@ def main() -> None:
                 "requested_num_groups": int(requested_num_groups),
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
-            _save_grouping_cache(output_dir, grouping, meta=cache_meta)
-            _save_grouping_cache(grouping_cache_dir, grouping, meta=cache_meta)
+            save_grouping_cache(output_dir, grouping, meta=cache_meta)
+            save_grouping_cache(grouping_cache_dir, grouping, meta=cache_meta)
             print(f"[cache] Saved grouping cache to: {grouping_cache_dir}")
     else:
         # 缓存命中时也同步一份到当前 output_dir，保证本次实验目录完整。
         if not args.disable_grouping_cache:
             cache_meta = {
                 "grouping_method_used": grouping["grouping_method_used"],
+                "grouping_stage_used": grouping.get("grouping_stage_used", "cache"),
                 "grouping_method_requested": args.grouping_method,
+                "grouping_stage_requested": args.grouping_stage,
                 "group_feature": args.group_feature,
                 "cache_key": cache_key,
                 "raw_count": int(n_total),
@@ -1669,7 +1230,7 @@ def main() -> None:
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "loaded_from_cache": True,
             }
-            _save_grouping_cache(output_dir, grouping, meta=cache_meta)
+            save_grouping_cache(output_dir, grouping, meta=cache_meta)
 
     group_id_per_sample = np.asarray(grouping["group_id_per_sample"], dtype=np.int32)
     representative_indices = np.asarray(grouping["representative_indices"], dtype=np.int64)
@@ -1678,6 +1239,8 @@ def main() -> None:
     group_to_indices: List[np.ndarray] = grouping["group_to_indices"]
     actual_num_groups = int(grouping["actual_num_groups"])
     grouping_method_used = str(grouping["grouping_method_used"])
+    grouping_stage_used = str(grouping.get("grouping_stage_used", args.grouping_stage))
+    scenario_partition_summary = grouping.get("scenario_partition_summary", [])
 
     if representative_indices.shape[0] < int(0.8 * requested_num_groups):
         print(
@@ -1687,6 +1250,7 @@ def main() -> None:
 
     _print_grouping_summary(
         grouping_method=grouping_method_used,
+        grouping_stage=grouping_stage_used,
         group_feature=args.group_feature,
         requested_num_groups=requested_num_groups,
         actual_num_groups=actual_num_groups,
@@ -1704,6 +1268,7 @@ def main() -> None:
 
     group_summary = {
         "grouping_method": grouping_method_used,
+        "grouping_stage": grouping_stage_used,
         "group_feature": args.group_feature,
         "requested_num_groups": int(requested_num_groups),
         "actual_num_groups": int(actual_num_groups),
@@ -1711,12 +1276,28 @@ def main() -> None:
         "loaded_from_cache": bool(grouping_loaded_from_cache),
         "cache_key": cache_key,
         "grouping_cache_dir": grouping_cache_dir,
+        "scenario_partition_summary": scenario_partition_summary,
         "group_size_percentiles": _percentiles(group_sizes.astype(np.float32)),
         "representative_distance_to_center_percentiles": _percentiles(rep_dist.astype(np.float32)),
         "representative_indices_path": representative_indices_path,
         "group_id_per_sample_path": group_id_per_sample_path,
         "group_sizes_path": group_sizes_path,
     }
+
+    group_vis_info = None
+    if int(args.num_group_visualizations) > 0:
+        group_vis_dir = os.path.join(output_dir, "group_visualizations")
+        group_vis_info = save_random_group_visualizations(
+            trajs=trajs,
+            representative_indices=representative_indices,
+            group_to_indices=group_to_indices,
+            save_dir=group_vis_dir,
+            num_groups=int(args.num_group_visualizations),
+            max_members_per_group=int(args.max_members_per_group_vis),
+            seed=int(args.seed),
+        )
+        group_summary["group_visualization"] = group_vis_info
+
     _write_json(os.path.join(output_dir, "group_summary.json"), group_summary)
 
     if args.experiment_mode == "representative_group":

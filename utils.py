@@ -1,6 +1,8 @@
 import numpy as np
 import pickle
 import os
+import json
+import csv
 
 from scipy.fft import dct, idct
 
@@ -11,6 +13,58 @@ DEFAULT_BASE_DATA_PATH = "/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.
 DEFAULT_AUGMENTED_DATA_PATH = (
     "/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas_augmented_reverse_detour_directuturn_hs120.npy"
 )
+
+
+def to_py(obj):
+    """递归转成 Python 原生类型，确保 json.dump 不报错。"""
+    if isinstance(obj, dict):
+        return {str(k): to_py(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_py(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [to_py(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.float16, np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, (np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
+        return int(obj)
+    if isinstance(obj, torch.Tensor):
+        return to_py(obj.detach().cpu().numpy())
+    return obj
+
+
+def percentiles(arr: np.ndarray) -> dict:
+    """返回常用百分位统计（p0/p25/p50/p75/p95/p99/max）。"""
+    if arr.size == 0:
+        return {k: 0.0 for k in ["p0", "p25", "p50", "p75", "p95", "p99", "max"]}
+    q = np.percentile(arr, [0, 25, 50, 75, 95, 99])
+    return {
+        "p0": float(q[0]),
+        "p25": float(q[1]),
+        "p50": float(q[2]),
+        "p75": float(q[3]),
+        "p95": float(q[4]),
+        "p99": float(q[5]),
+        "max": float(np.max(arr)),
+    }
+
+
+def write_json(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(to_py(data), f, indent=2)
+
+
+def write_csv(rows: list, path: str) -> None:
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _load_traj_array(data_path: str) -> np.ndarray:
