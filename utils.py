@@ -13,7 +13,9 @@ DEFAULT_BASE_DATA_PATH = "/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas.
 DEFAULT_AUGMENTED_DATA_PATH = (
     "/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas_augmented_reverse_detour_directuturn_hs120.npy"
 )
-
+DEFAULT_AUGMENTED_DATA_PATH_filtered = (
+    "/home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas_augmented_reverse_detour_directuturn_hs120_group_loss_filtered.npy"
+)
 
 def to_py(obj):
     """递归转成 Python 原生类型，确保 json.dump 不报错。"""
@@ -91,7 +93,9 @@ def load_traj_array(data_path: str, dtype=np.float32) -> np.ndarray:
 
 def resolve_default_data_path() -> str:
     """优先使用增强数据，若不存在则回退到基础数据。"""
-    if os.path.exists(DEFAULT_AUGMENTED_DATA_PATH):
+    if os.path.exists(DEFAULT_AUGMENTED_DATA_PATH_filtered):
+        return DEFAULT_AUGMENTED_DATA_PATH_filtered
+    elif os.path.exists(DEFAULT_AUGMENTED_DATA_PATH):
         return DEFAULT_AUGMENTED_DATA_PATH
     return DEFAULT_BASE_DATA_PATH
 
