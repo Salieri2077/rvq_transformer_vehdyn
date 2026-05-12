@@ -203,6 +203,74 @@ class ResidualVQ(nn.Module):
             
         return quantized_out, all_losses, codes
 
+    def forward_with_distances(self, x):
+        """
+        与 forward 使用相同的 residual quantization 顺序，但额外返回每层距离矩阵。
+
+        Args:
+            x: [B, D] 或 [B, T, D] - 输入特征
+        Returns:
+            quantized_out: 量化后的输出，维度与输入相同
+            all_losses: VQ 损失（标量；这里只复用 commitment 形式，不更新 EMA）
+            codes: [B, num_layers] 或 [B, T, num_layers]
+            all_dists: list，每层为 [B, vocab_size] 或 [B, T, vocab_size]
+        """
+        input_dim = x.dim()
+        original_shape = x.shape
+
+        if input_dim == 3:
+            B, T, D = x.shape
+            x = x.view(B * T, D)
+            need_reshape = True
+        else:
+            need_reshape = False
+
+        quantized_out = torch.zeros_like(x)
+        residual = x
+        all_losses = x.new_zeros(())
+        all_indices = []
+        all_dists = []
+
+        n_layers = len(self.layers)
+        dropout_start_idx = self._get_dropout_start_idx(n_layers)
+
+        for i, layer in enumerate(self.layers):
+            if i >= dropout_start_idx:
+                break
+
+            flat_input = residual.view(-1, layer.embedding_dim)
+            codebook = layer.embedding.to(flat_input.dtype)
+            distances = (
+                torch.sum(flat_input ** 2, dim=1, keepdim=True)
+                + torch.sum(codebook ** 2, dim=1)
+                - 2 * torch.matmul(flat_input, codebook.t())
+            )
+            indices = torch.argmin(distances, dim=1)
+            quantized = F.embedding(indices, codebook)
+
+            e_latent_loss = F.mse_loss(quantized.detach(), residual)
+            loss = layer.commitment_cost * e_latent_loss
+            x_q = residual + (quantized - residual).detach()
+
+            quantized_out = quantized_out + x_q
+            residual = residual - x_q
+            all_losses = all_losses + loss
+            all_indices.append(indices)
+            all_dists.append(distances)
+
+        if len(all_indices) > 0:
+            codes = torch.stack(all_indices, dim=1)
+            if need_reshape:
+                codes = codes.view(B, T, -1)
+                all_dists = [dist.view(B, T, -1) for dist in all_dists]
+        else:
+            codes = None
+
+        if need_reshape:
+            quantized_out = quantized_out.view(original_shape)
+
+        return quantized_out, all_losses, codes, all_dists
+
     def decode_from_indices(self, indices):
         """
         Args:

@@ -400,6 +400,88 @@ def select_worst_reconstruction_indices(
     return out
 
 
+def build_unclassified_mask(categories: Dict[str, np.ndarray], total_samples: int) -> np.ndarray:
+    if total_samples <= 0:
+        return np.zeros((0,), dtype=bool)
+    covered = np.zeros((total_samples,), dtype=bool)
+    for mask in categories.values():
+        covered |= np.asarray(mask, dtype=bool)
+    return ~covered
+
+
+def select_endpoint_sign_flip_indices(
+    trajs: np.ndarray,
+    recon_trajs: np.ndarray,
+    categories: Dict[str, np.ndarray],
+    num_samples: int,
+    dt: float,
+    sign_eps: float = 1e-3,
+    exclude_indices: Optional[Dict[str, List[int]]] = None,
+) -> Dict[str, List[Dict]]:
+    gt_prof = compute_kinematic_profiles(trajs, dt=dt)
+    pred_prof = compute_kinematic_profiles(recon_trajs, dt=dt)
+
+    gt_end_xy = gt_prof["xy"][:, -1, :]
+    pred_end_xy = pred_prof["xy"][:, -1, :]
+    end_err = np.sqrt(np.sum((pred_end_xy - gt_end_xy) ** 2, axis=-1) + 1e-6)
+    end_x_abs_diff = np.abs(pred_end_xy[:, 0] - gt_end_xy[:, 0])
+    end_y_abs_diff = np.abs(pred_end_xy[:, 1] - gt_end_xy[:, 1])
+    min_flip_endpoint_gap_m = 1.0 # 最小距离设置为1m，以避免微小误差导致的符号翻转被误判为有意义的翻转
+
+    x_flip = (
+        (np.abs(gt_end_xy[:, 0]) > sign_eps)
+        & (np.abs(pred_end_xy[:, 0]) > sign_eps)
+        & (gt_end_xy[:, 0] * pred_end_xy[:, 0] < 0.0)
+        & (end_x_abs_diff >= min_flip_endpoint_gap_m)
+    )
+    y_flip = (
+        (np.abs(gt_end_xy[:, 1]) > sign_eps)
+        & (np.abs(pred_end_xy[:, 1]) > sign_eps)
+        & (gt_end_xy[:, 1] * pred_end_xy[:, 1] < 0.0)
+        & (end_y_abs_diff >= min_flip_endpoint_gap_m)
+    )
+    sign_flip_mask = x_flip | y_flip
+
+    out = {}
+    for scenario_name, mask in categories.items():
+        idxs = np.where(mask & sign_flip_mask)[0]
+        if len(idxs) == 0 or num_samples <= 0:
+            out[scenario_name] = []
+            continue
+
+        used_signatures: Set[bytes] = set()
+        if exclude_indices is not None:
+            for ex_idx in exclude_indices.get(scenario_name, []):
+                used_signatures.add(traj_signature(trajs[int(ex_idx)]))
+
+        order = np.argsort(-end_err[idxs])
+        selected_items: List[Dict] = []
+        for i in order:
+            sample_idx = int(idxs[i])
+            sign = traj_signature(trajs[sample_idx])
+            if sign in used_signatures:
+                continue
+            used_signatures.add(sign)
+            selected_items.append(
+                {
+                    "idx": sample_idx,
+                    "info": {
+                        "x_flip": bool(x_flip[sample_idx]),
+                        "y_flip": bool(y_flip[sample_idx]),
+                        "endpoint_error_m": float(end_err[sample_idx]),
+                        "gt_end_x_m": float(gt_end_xy[sample_idx, 0]),
+                        "gt_end_y_m": float(gt_end_xy[sample_idx, 1]),
+                        "pred_end_x_m": float(pred_end_xy[sample_idx, 0]),
+                        "pred_end_y_m": float(pred_end_xy[sample_idx, 1]),
+                    },
+                }
+            )
+            if len(selected_items) >= num_samples:
+                break
+        out[scenario_name] = selected_items
+    return out
+
+
 def plot_representative_case(
     scenario_name: str,
     sample_idx: int,
@@ -408,6 +490,7 @@ def plot_representative_case(
     dt: float,
     save_path: str,
     sample_tokens: Optional[np.ndarray] = None,
+    metrics: Optional[Dict[str, float]] = None,
 ):
     gt_prof = compute_kinematic_profiles(gt_traj[None, ...], dt)
     pred_prof = compute_kinematic_profiles(pred_traj[None, ...], dt)
@@ -506,11 +589,67 @@ def plot_representative_case(
         token_values = np.asarray(sample_tokens).reshape(-1)[:15]
         token_values_str = ", ".join(str(int(v)) for v in token_values)
         title = f"{title}\nTokens(15): [{token_values_str}]"
+    if metrics is not None:
+        title = (
+            f"{title}\n"
+            f"recon_mse={float(metrics.get('recon_mse', 0.0)):.6f}, "
+            f"ADE={float(metrics.get('ade', 0.0)):.3f}m, "
+            f"FDE={float(metrics.get('fde', 0.0)):.3f}m, "
+            f"max_error={float(metrics.get('max_error', 0.0)):.3f}m"
+        )
 
     fig.suptitle(title)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(save_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
+
+
+def select_plot_indices_with_acc_gate(
+    *,
+    primary_indices: List[int],
+    fallback_indices: np.ndarray,
+    target_count: int,
+    trajs: np.ndarray,
+    recon_trajs: np.ndarray,
+    dt: float,
+    acc_max: float,
+    acc_peak_cache: Dict[int, float],
+) -> Tuple[List[int], int]:
+    """先按主候选筛，再在同场景补齐；筛选条件是重建 |acc| 峰值 <= acc_max。"""
+    selected: List[int] = []
+    used_signatures: Set[bytes] = set()
+    rejected_by_acc = 0
+
+    def _get_peak_acc(sample_idx: int) -> float:
+        if sample_idx not in acc_peak_cache:
+            prof = compute_kinematic_profiles(recon_trajs[sample_idx: sample_idx + 1], dt=dt)
+            acc_peak_cache[sample_idx] = float(np.max(np.abs(prof["acc"][0])))
+        return float(acc_peak_cache[sample_idx])
+
+    def _try_add(sample_idx: int) -> bool:
+        nonlocal rejected_by_acc
+        sign = traj_signature(trajs[sample_idx])
+        if sign in used_signatures:
+            return False
+        if _get_peak_acc(int(sample_idx)) > float(acc_max):
+            rejected_by_acc += 1
+            return False
+        used_signatures.add(sign)
+        selected.append(int(sample_idx))
+        return True
+
+    for idx in primary_indices:
+        if len(selected) >= target_count:
+            break
+        _try_add(int(idx))
+
+    if len(selected) < target_count:
+        for idx in fallback_indices.tolist():
+            if len(selected) >= target_count:
+                break
+            _try_add(int(idx))
+
+    return selected, rejected_by_acc
 
 
 def infer_model_type(model_path: str, model_type: str) -> str:
@@ -528,12 +667,25 @@ def build_model(
     device: torch.device,
     model_type: str,
     num_transformer_layers: int = 2,
+    num_layers: int = 15,
 ) -> ModelUnion:
+    state_dict = torch.load(model_path, map_location=device)
+    if int(num_layers) <= 0:
+        layer_ids = []
+        for key in state_dict.keys():
+            parts = key.split(".")
+            if len(parts) >= 3 and parts[0] == "rvq" and parts[1] == "layers":
+                try:
+                    layer_ids.append(int(parts[2]))
+                except ValueError:
+                    pass
+        num_layers = (max(layer_ids) + 1) if layer_ids else 15
+
     if model_type == "accint":
         model = AccFirstRVQTokenizer(
             input_steps=input_steps,
             input_dim=3,
-            num_layers=15,
+            num_layers=int(num_layers),
             vocab_size=1024,
             d_model=128,
             nhead=4,
@@ -544,13 +696,12 @@ def build_model(
         model = TrajRVQTransformer(
             input_steps=input_steps,
             input_dim=3,
-            num_layers=15,
+            num_layers=int(num_layers),
             vocab_size=1024,
             d_model=128,
             nhead=4,
             num_transformer_layers=num_transformer_layers,
         ).to(device)
-    state_dict = torch.load(model_path, map_location=device)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     return model
@@ -586,7 +737,11 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--num-var-plots", type=int, default=3)
     parser.add_argument("--num-worst-plots", type=int, default=3)
+    parser.add_argument("--num-sign-flip-plots", type=int, default=0)
+    parser.add_argument("--num-unclassified-plots", type=int, default=0)
     parser.add_argument("--num-transformer-layers", type=int, default=2)
+    parser.add_argument("--num-layers", type=int, default=15)
+    parser.add_argument("--plot-acc-max", type=float, default=8.0)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -616,6 +771,7 @@ def main():
         device=device,
         model_type=resolved_model_type,
         num_transformer_layers=args.num_transformer_layers,
+        num_layers=args.num_layers,
     )
     norm_params = load_norm_params(norm_path, device)
     model.set_norm_params(norm_params["mean"], norm_params["std"], norm_params["scale_factor"])
@@ -648,12 +804,34 @@ def main():
         dt=args.dt,
         exclude_indices=worst_exclude_indices,
     )
+    sign_flip_representatives = select_endpoint_sign_flip_indices(
+        trajs=trajs,
+        recon_trajs=recon_trajs,
+        categories=categories,
+        num_samples=args.num_sign_flip_plots,
+        dt=args.dt,
+        exclude_indices=worst_exclude_indices,
+    )
+    unclassified_mask = build_unclassified_mask(categories, len(trajs))
+    unclassified_categories = {"Unclassified": unclassified_mask}
+    unclassified_representatives = select_worst_reconstruction_indices(
+        trajs=trajs,
+        recon_trajs=recon_trajs,
+        categories=unclassified_categories,
+        num_samples=args.num_unclassified_plots,
+        dt=args.dt,
+    )
 
     total_samples = max(int(len(trajs)), 1)
     scenario_counts = {name: int(mask.sum()) for name, mask in categories.items()}
     scenario_ratios = {name: float(count / total_samples) for name, count in scenario_counts.items()}
+    unclassified_count = int(unclassified_mask.sum())
+    unclassified_ratio = float(unclassified_count / total_samples)
 
     metrics_by_scenario = {}
+    plot_saved_count = 0
+    plot_rejected_by_acc_count = 0
+    acc_peak_cache: Dict[int, float] = {}
     for scenario_name, mask in categories.items():
         idxs = np.where(mask)[0]
         if len(idxs) == 0:
@@ -673,18 +851,43 @@ def main():
         )
         metrics_by_scenario[scenario_name] = metrics
 
-        if rep_idx is not None:
+        primary_classic = [int(rep_idx)] if rep_idx is not None else []
+        classic_indices, rej = select_plot_indices_with_acc_gate(
+            primary_indices=primary_classic,
+            fallback_indices=idxs,
+            target_count=1 if rep_idx is not None else 0,
+            trajs=trajs,
+            recon_trajs=recon_trajs,
+            dt=args.dt,
+            acc_max=args.plot_acc_max,
+            acc_peak_cache=acc_peak_cache,
+        )
+        plot_rejected_by_acc_count += rej
+        for classic_idx in classic_indices:
             plot_representative_case(
                 scenario_name=scenario_name,
-                sample_idx=rep_idx,
-                gt_traj=trajs[rep_idx],
-                pred_traj=recon_trajs[rep_idx],
+                sample_idx=classic_idx,
+                gt_traj=trajs[classic_idx],
+                pred_traj=recon_trajs[classic_idx],
                 dt=args.dt,
                 save_path=os.path.join(output_dir, f"{scenario_name}_classic.png"),
-                sample_tokens=codes[rep_idx],
+                sample_tokens=codes[classic_idx],
             )
-        for plot_id, item in enumerate(variation_representatives[scenario_name], start=1):
-            var_idx = item["idx"]
+            plot_saved_count += 1
+
+        primary_var = [int(item["idx"]) for item in variation_representatives[scenario_name]]
+        var_indices, rej = select_plot_indices_with_acc_gate(
+            primary_indices=primary_var,
+            fallback_indices=idxs,
+            target_count=int(args.num_var_plots),
+            trajs=trajs,
+            recon_trajs=recon_trajs,
+            dt=args.dt,
+            acc_max=args.plot_acc_max,
+            acc_peak_cache=acc_peak_cache,
+        )
+        plot_rejected_by_acc_count += rej
+        for plot_id, var_idx in enumerate(var_indices, start=1):
             plot_representative_case(
                 scenario_name=f"{scenario_name} Var{plot_id}",
                 sample_idx=var_idx,
@@ -694,8 +897,21 @@ def main():
                 save_path=os.path.join(output_dir, f"{scenario_name}_var{plot_id:02d}.png"),
                 sample_tokens=codes[var_idx],
             )
-        for plot_id, item in enumerate(worst_representatives[scenario_name], start=1):
-            worst_idx = item["idx"]
+            plot_saved_count += 1
+
+        primary_worst = [int(item["idx"]) for item in worst_representatives[scenario_name]]
+        worst_indices, rej = select_plot_indices_with_acc_gate(
+            primary_indices=primary_worst,
+            fallback_indices=idxs,
+            target_count=int(args.num_worst_plots),
+            trajs=trajs,
+            recon_trajs=recon_trajs,
+            dt=args.dt,
+            acc_max=args.plot_acc_max,
+            acc_peak_cache=acc_peak_cache,
+        )
+        plot_rejected_by_acc_count += rej
+        for plot_id, worst_idx in enumerate(worst_indices, start=1):
             plot_representative_case(
                 scenario_name=f"{scenario_name} Worst{plot_id}",
                 sample_idx=worst_idx,
@@ -705,6 +921,60 @@ def main():
                 save_path=os.path.join(output_dir, f"{scenario_name}_worst_{plot_id:02d}.png"),
                 sample_tokens=codes[worst_idx],
             )
+            plot_saved_count += 1
+
+        primary_flip = [int(item["idx"]) for item in sign_flip_representatives[scenario_name]]
+        flip_indices, rej = select_plot_indices_with_acc_gate(
+            primary_indices=primary_flip,
+            fallback_indices=idxs,
+            target_count=int(args.num_sign_flip_plots),
+            trajs=trajs,
+            recon_trajs=recon_trajs,
+            dt=args.dt,
+            acc_max=args.plot_acc_max,
+            acc_peak_cache=acc_peak_cache,
+        )
+        plot_rejected_by_acc_count += rej
+        for plot_id, flip_idx in enumerate(flip_indices, start=1):
+            plot_representative_case(
+                scenario_name=f"{scenario_name} SignFlip{plot_id}",
+                sample_idx=flip_idx,
+                gt_traj=trajs[flip_idx],
+                pred_traj=recon_trajs[flip_idx],
+                dt=args.dt,
+                save_path=os.path.join(output_dir, f"{scenario_name}_signflip_{plot_id:02d}.png"),
+                sample_tokens=codes[flip_idx],
+            )
+            plot_saved_count += 1
+
+    unclassified_indices = np.where(unclassified_mask)[0]
+    if len(unclassified_indices) > 0:
+        unclassified_metrics = scenario_metrics(trajs[unclassified_indices], recon_trajs[unclassified_indices], dt=args.dt)
+    else:
+        unclassified_metrics = {"count": 0}
+    primary_unclassified = [int(item["idx"]) for item in unclassified_representatives["Unclassified"]]
+    unclassified_plot_indices, rej = select_plot_indices_with_acc_gate(
+        primary_indices=primary_unclassified,
+        fallback_indices=unclassified_indices,
+        target_count=int(args.num_unclassified_plots),
+        trajs=trajs,
+        recon_trajs=recon_trajs,
+        dt=args.dt,
+        acc_max=args.plot_acc_max,
+        acc_peak_cache=acc_peak_cache,
+    )
+    plot_rejected_by_acc_count += rej
+    for plot_id, unclassified_idx in enumerate(unclassified_plot_indices, start=1):
+        plot_representative_case(
+            scenario_name=f"Unclassified Worst{plot_id}",
+            sample_idx=unclassified_idx,
+            gt_traj=trajs[unclassified_idx],
+            pred_traj=recon_trajs[unclassified_idx],
+            dt=args.dt,
+            save_path=os.path.join(output_dir, f"Unclassified_worst_{plot_id:02d}.png"),
+            sample_tokens=codes[unclassified_idx],
+        )
+        plot_saved_count += 1
 
     overall_metrics = scenario_metrics(trajs, recon_trajs, dt=args.dt)
     summary = {
@@ -720,15 +990,25 @@ def main():
             "output_dir": output_dir,
             "num_var_plots": args.num_var_plots,
             "num_worst_plots": args.num_worst_plots,
+            "num_sign_flip_plots": args.num_sign_flip_plots,
+            "num_unclassified_plots": args.num_unclassified_plots,
             "num_transformer_layers": args.num_transformer_layers,
+            "plot_acc_max": args.plot_acc_max,
         },
         "overall": overall_metrics,
         "scenarios": metrics_by_scenario,
         "representatives": representatives,
         "variation_representatives": variation_representatives,
         "worst_representatives": worst_representatives,
+        "sign_flip_representatives": sign_flip_representatives,
         "scenario_counts": scenario_counts,
         "scenario_ratios": scenario_ratios,
+        "unclassified": {
+            "count": unclassified_count,
+            "ratio": unclassified_ratio,
+            "metrics": unclassified_metrics,
+            "representatives": unclassified_representatives["Unclassified"],
+        },
         "token_shape": list(codes.shape),
     }
 
@@ -747,6 +1027,11 @@ def main():
     for scenario_name, count in scenario_counts.items():
         ratio = scenario_ratios[scenario_name]
         print(f"{scenario_name}: count={count}, ratio={ratio:.4f}")
+    print(f"Unclassified: count={unclassified_count}, ratio={unclassified_ratio:.4f}")
+    print(
+        f"Plot filter: preselect acc_peak<= {args.plot_acc_max:.2f} m/s^2 "
+        f"| saved={plot_saved_count}, rejected_candidates={plot_rejected_by_acc_count}"
+    )
     print("=" * 80)
     print("Scenario Metrics")
     for scenario_name, metrics in metrics_by_scenario.items():
@@ -768,7 +1053,9 @@ if __name__ == "__main__":
 #   --data-type pred \
 #   --num-var-plots 3 \
 #   --num-worst-plots 5 \
-#   --model-type taae
+#   --model-type taae \
+#   --num-sign-flip-plots 3 \
+#   --num-unclassified-plots 0
 
 # python eval_tokenizer_by_scenario.py \
 #   --data-path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas_augmented_reverse_detour_directuturn_hs120.npy \
