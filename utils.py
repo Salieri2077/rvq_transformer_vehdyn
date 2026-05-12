@@ -150,6 +150,12 @@ def denormalize_trajs_torch(
     return x_norm * scale_factor * (std + 1e-8) + mean
 
 
+def token_sequence_to_str(tokens) -> str:
+    """把一条轨迹的 RVQ token 序列保存成紧凑可读的 CSV 字段。"""
+    values = np.asarray(tokens).reshape(-1)
+    return "[" + ",".join(str(int(v)) for v in values.tolist()) + "]"
+
+
 def finite_diff_keep_shape(x: np.ndarray, dt: float) -> np.ndarray:
     if x.shape[-1] <= 1:
         return np.zeros_like(x)
@@ -338,6 +344,34 @@ def compute_kinematic_profiles(trajs: np.ndarray, dt: float):
         "curvature": curvature,
         "local_vx": local_vx,
         "local_vy": local_vy,
+    }
+
+
+def compute_reconstruction_case_metrics(gt_trajs: np.ndarray, pred_trajs: np.ndarray, dt: float) -> dict:
+    """
+    逐条计算重建质量指标。
+
+    recon_mse 在原始 dxdydyaw 空间计算；ADE/FDE/max_error 先积分到全局 XY，
+    与 eval_tokenizer_by_scenario.py 中 worst case 排序使用的轨迹误差口径一致。
+    """
+    gt_trajs = np.asarray(gt_trajs, dtype=np.float32)
+    pred_trajs = np.asarray(pred_trajs, dtype=np.float32)
+    if gt_trajs.shape != pred_trajs.shape:
+        raise ValueError(f"gt/pred shape mismatch: {gt_trajs.shape} vs {pred_trajs.shape}")
+    if gt_trajs.ndim != 3 or gt_trajs.shape[-1] != 3:
+        raise ValueError(f"Expected [N, T, 3] trajectories, got {gt_trajs.shape}")
+
+    gt_prof = compute_kinematic_profiles(gt_trajs, dt=dt)
+    pred_prof = compute_kinematic_profiles(pred_trajs, dt=dt)
+
+    step_dist_error = np.sqrt(np.sum((pred_prof["xy"] - gt_prof["xy"]) ** 2, axis=-1) + 1e-6)
+    recon_mse = np.mean((pred_trajs - gt_trajs) ** 2, axis=(1, 2))
+
+    return {
+        "recon_mse": recon_mse.astype(np.float64),
+        "ade": step_dist_error.mean(axis=1).astype(np.float64),
+        "fde": step_dist_error[:, -1].astype(np.float64),
+        "max_error": step_dist_error.max(axis=1).astype(np.float64),
     }
 
 
