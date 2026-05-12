@@ -6,10 +6,11 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-
+import torch.nn.functional as F
+import argparse
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-RVQ_DIR = os.path.join(THIS_DIR, "rvq_transformer_vehdyn")
+RVQ_DIR = THIS_DIR
 if RVQ_DIR not in sys.path:
     sys.path.insert(0, RVQ_DIR)
 
@@ -23,8 +24,10 @@ from grouping_pipeline import try_load_grouping_from_cache  # noqa: E402
 from utils import (  # noqa: E402
     compute_kinematic_profiles,
     compute_reconstruction_case_metrics,
+    denormalize_trajs_torch,
     load_norm_params_torch,
     load_traj_array,
+    normalize_trajs_torch,
     token_sequence_to_str,
     write_csv,
     write_json,
@@ -57,6 +60,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=4096)
     parser.add_argument("--num_layers", "--num-layers", dest="num_layers", type=int, default=0)
     parser.add_argument("--num_transformer_layers", "--num-transformer-layers", dest="num_transformer_layers", type=int, default=2)
+    parser.add_argument(
+        "--loss_epoch",
+        "--loss-epoch",
+        dest="loss_epoch",
+        type=int,
+        default=31,
+        help="Only controls train-style kin_smooth weight: 1e-2 if loss_epoch > 30 else 0.",
+    )
     parser.add_argument("--dt", type=float, default=0.2)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     return parser.parse_args()
@@ -165,12 +176,169 @@ def rank_desc(values: np.ndarray, target_pos: int) -> int:
 
 
 def metric_at(metrics: Dict[str, np.ndarray], pos: int) -> Dict[str, float]:
-    return {
-        "recon_mse": float(metrics["recon_mse"][pos]),
-        "ade": float(metrics["ade"][pos]),
-        "fde": float(metrics["fde"][pos]),
-        "max_error": float(metrics["max_error"][pos]),
-    }
+    return {key: float(values[pos]) for key, values in metrics.items()}
+
+
+def integrate_to_global_torch(trajs: torch.Tensor) -> torch.Tensor:
+    dx = trajs[:, :, 0]
+    dy = trajs[:, :, 1]
+    dyaw = trajs[:, :, 2]
+    yaw = torch.cumsum(dyaw, dim=1)
+    prev_yaw = torch.zeros_like(yaw)
+    if trajs.shape[1] > 1:
+        prev_yaw[:, 1:] = yaw[:, :-1]
+
+    dx_global = dx * torch.cos(prev_yaw) - dy * torch.sin(prev_yaw)
+    dy_global = dx * torch.sin(prev_yaw) + dy * torch.cos(prev_yaw)
+    return torch.stack([torch.cumsum(dx_global, dim=1), torch.cumsum(dy_global, dim=1)], dim=-1)
+
+
+def per_case_vq_loss_from_latent(model, z: torch.Tensor) -> torch.Tensor:
+    """
+    训练时 VQ loss 是 batch mean；这里沿用 residual quantization 顺序，
+    拆成 per-case commitment loss，便于定位单个 sample 的贡献。
+    """
+    residual = z
+    losses = z.new_zeros((z.shape[0],))
+    for layer in model.rvq.layers:
+        flat_input = residual.view(-1, layer.embedding_dim)
+        codebook = layer.embedding.to(flat_input.dtype)
+        distances = (
+            torch.sum(flat_input ** 2, dim=1, keepdim=True)
+            + torch.sum(codebook ** 2, dim=1)
+            - 2 * torch.matmul(flat_input, codebook.t())
+        )
+        indices = torch.argmin(distances, dim=1)
+        quantized = F.embedding(indices, codebook)
+        losses = losses + float(layer.commitment_cost) * torch.mean((quantized.detach() - residual) ** 2, dim=1)
+        x_q = residual + (quantized - residual).detach()
+        residual = residual - x_q
+    return losses
+
+
+def compute_train_style_loss_components(
+    model,
+    trajs: np.ndarray,
+    norm_params: Dict[str, torch.Tensor],
+    batch_size: int,
+    loss_epoch: int,
+) -> Dict[str, np.ndarray]:
+    """
+    逐条输出与 train_tfm.py TensorBoard loss/weight_* 对齐的诊断项。
+
+    recon/vel/acc/turn/kin_smooth 都按单条轨迹计算；VQ 用同一 RVQ residual
+    顺序计算 per-case commitment loss。weight_* 的系数与训练脚本一致。
+    """
+    kin_smooth_weight = 1e-2 if int(loss_epoch) > 30 else 0.0
+    keys = [
+        "train_recon_loss",
+        "train_vq_loss",
+        "train_vel_loss",
+        "train_acc_loss",
+        "train_kin_smooth_loss",
+        "train_turn_global_loss",
+        "train_turn_yaw_loss",
+        "weight_recon",
+        "weight_vq",
+        "weight_vel",
+        "weight_acc",
+        "weight_kin_smooth",
+        "weight_turn_global",
+        "weight_turn_yaw",
+        "weight",
+    ]
+    out = {key: [] for key in keys}
+
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(trajs), int(batch_size)):
+            batch = trajs[start:start + int(batch_size)]
+            x_norm = normalize_trajs_torch(
+                batch,
+                mean=norm_params["mean"],
+                std=norm_params["std"],
+                scale_factor=norm_params["scale_factor"],
+                clip_limit=norm_params["clip_limit"],
+            )
+
+            z = model.encode(x_norm)
+            vq_loss_case = per_case_vq_loss_from_latent(model, z)
+            x_recon, _, _, v, kappa = model(x_norm)
+
+            recon_dxdy = torch.mean((x_recon[..., :2] - x_norm[..., :2]) ** 2, dim=(1, 2))
+            recon_dyaw = torch.mean((x_recon[..., 2] - x_norm[..., 2]) ** 2, dim=1)
+            recon_loss = recon_dxdy + 14.0 * recon_dyaw
+
+            pred_phys = (x_recon * model.norm_scale * model.norm_std) + model.norm_mean
+            gt_phys = (x_norm * model.norm_scale * model.norm_std) + model.norm_mean
+
+            vx_pred = pred_phys[:, :, 0] / model.dt
+            vy_pred = pred_phys[:, :, 1] / model.dt
+            vx_gt = gt_phys[:, :, 0] / model.dt
+            vy_gt = gt_phys[:, :, 1] / model.dt
+            vel_loss = torch.mean((vx_pred - vx_gt) ** 2, dim=1) + 0.2 * torch.mean((vy_pred - vy_gt) ** 2, dim=1)
+
+            if pred_phys.shape[1] > 1:
+                ax_pred = (vx_pred[:, 1:] - vx_pred[:, :-1]) / model.dt
+                ax_gt = (vx_gt[:, 1:] - vx_gt[:, :-1]) / model.dt
+                ay_pred = (vy_pred[:, 1:] - vy_pred[:, :-1]) / model.dt
+                ay_gt = (vy_gt[:, 1:] - vy_gt[:, :-1]) / model.dt
+                acc_loss = torch.mean((ax_pred - ax_gt) ** 2, dim=1) + 0.2 * torch.mean((ay_pred - ay_gt) ** 2, dim=1)
+
+                acc = (v[:, 1:] - v[:, :-1]) / model.dt
+                kappa_rate = (kappa[:, 1:] - kappa[:, :-1]) / model.dt
+                kin_smooth_loss = torch.mean(acc ** 2, dim=1) + torch.mean(kappa_rate ** 2, dim=1)
+            else:
+                acc_loss = torch.zeros_like(recon_loss)
+                kin_smooth_loss = torch.zeros_like(recon_loss)
+
+            net_yaw = torch.sum(gt_phys[:, :, 2], dim=1)
+            turn_mask = torch.abs(net_yaw) > 0.35
+            turn_global_loss = torch.zeros_like(recon_loss)
+            turn_yaw_loss = torch.zeros_like(recon_loss)
+            if torch.any(turn_mask):
+                pred_xy = integrate_to_global_torch(pred_phys[turn_mask])
+                gt_xy = integrate_to_global_torch(gt_phys[turn_mask])
+                turn_global_loss[turn_mask] = torch.mean((pred_xy - gt_xy) ** 2, dim=(1, 2))
+
+                pred_yaw = torch.cumsum(pred_phys[turn_mask, :, 2], dim=1)
+                gt_yaw = torch.cumsum(gt_phys[turn_mask, :, 2], dim=1)
+                turn_yaw_loss[turn_mask] = torch.mean((pred_yaw - gt_yaw) ** 2, dim=1)
+
+            weighted = {
+                "weight_recon": 10.0 * recon_loss,
+                "weight_vq": 5.0 * vq_loss_case,
+                "weight_vel": 0.5 * vel_loss,
+                "weight_acc": 0.05 * acc_loss,
+                "weight_kin_smooth": kin_smooth_weight * kin_smooth_loss,
+                "weight_turn_global": turn_global_loss,
+                "weight_turn_yaw": 2.0 * turn_yaw_loss,
+            }
+            weight_total = (
+                weighted["weight_recon"]
+                + weighted["weight_vq"]
+                + weighted["weight_vel"]
+                + weighted["weight_acc"]
+                + weighted["weight_kin_smooth"]
+                + weighted["weight_turn_global"]
+                + weighted["weight_turn_yaw"]
+            )
+
+            batch_terms = {
+                "train_recon_loss": recon_loss,
+                "train_vq_loss": vq_loss_case,
+                "train_vel_loss": vel_loss,
+                "train_acc_loss": acc_loss,
+                "train_kin_smooth_loss": kin_smooth_loss,
+                "train_turn_global_loss": turn_global_loss,
+                "train_turn_yaw_loss": turn_yaw_loss,
+                **weighted,
+                "weight": weight_total,
+            }
+            for key, value in batch_terms.items():
+                out[key].append(value.detach().cpu().numpy())
+
+    return {key: np.concatenate(chunks, axis=0).astype(np.float64) for key, chunks in out.items()}
 
 
 def choose_visualization_indices(group_indices: np.ndarray, sample_idx: int, max_group_vis: int) -> np.ndarray:
@@ -182,6 +350,75 @@ def choose_visualization_indices(group_indices: np.ndarray, sample_idx: int, max
     return np.asarray(ordered[:max_group_vis], dtype=np.int64)
 
 
+def decode_group_mode_first_token(model, codes: np.ndarray, norm_params: Dict[str, torch.Tensor]) -> Tuple[np.ndarray, int, int]:
+    """构造人工 token：只取 group 内第一层 token 的众数，并只用这一层 token decode。"""
+    first_tokens = np.asarray(codes)[:, 0].astype(np.int64)
+    values, counts = np.unique(first_tokens, return_counts=True)
+    mode_token = int(values[int(np.argmax(counts))])
+    mode_count = int(np.max(counts))
+
+    token_tensor = torch.tensor([[mode_token]], dtype=torch.long, device=norm_params["mean"].device)
+    model.eval()
+    with torch.no_grad():
+        recon_norm = model.decode_from_codes(token_tensor)
+        recon = denormalize_trajs_torch(
+            recon_norm,
+            mean=norm_params["mean"],
+            std=norm_params["std"],
+            scale_factor=norm_params["scale_factor"],
+        )
+    return recon[0].detach().cpu().numpy().astype(np.float32), mode_token, mode_count
+
+
+def plot_recon_only_case(
+    sample_idx: int,
+    pred_traj: np.ndarray,
+    dt: float,
+    save_path: str,
+    title: str,
+) -> None:
+    """只画人工 token decode 出来的重建及运动学曲线，不画 GT。"""
+    pred_prof = compute_kinematic_profiles(pred_traj[None, ...], dt=dt)
+    pred_xy = pred_prof["xy"][0]
+    t = np.arange(pred_traj.shape[0]) * dt
+
+    fig, axes = plt.subplots(2, 4, figsize=(24, 10))
+    ax_traj, ax_vx, ax_vy, ax_v = axes[0]
+    ax_curv, ax_ax, ax_ay, ax_a = axes[1]
+
+    ax_traj.plot(pred_xy[:, 0], pred_xy[:, 1], label="Artificial token recon", linewidth=2.4, linestyle="--")
+    ax_traj.scatter(pred_xy[0, 0], pred_xy[0, 1], c="green", s=40, label="Start")
+    ax_traj.scatter(pred_xy[-1, 0], pred_xy[-1, 1], c="orange", s=40, label="Recon End")
+    ax_traj.set_title("Trajectory")
+    ax_traj.set_xlabel("X (m)")
+    ax_traj.set_ylabel("Y (m)")
+    ax_traj.grid(True, alpha=0.3)
+    ax_traj.axis("equal")
+    ax_traj.legend(fontsize=8)
+
+    for ax, key, label, ylabel in [
+        (ax_vx, "vx", "vx", "Velocity (m/s)"),
+        (ax_vy, "vy", "vy", "Velocity (m/s)"),
+        (ax_v, "speed", "v", "Speed (m/s)"),
+        (ax_curv, "curvature", "Signed Curvature", "Curvature (1/m)"),
+        (ax_ax, "ax", "ax", "Acceleration (m/s^2)"),
+        (ax_ay, "ay", "ay", "Acceleration (m/s^2)"),
+        (ax_a, "acc", "a", "Acceleration (m/s^2)"),
+    ]:
+        ax.plot(t, pred_prof[key][0], label=f"Recon {label}", linewidth=2.0, linestyle="--")
+        ax.axhline(0.0, color="gray", linewidth=1.0, alpha=0.6)
+        ax.set_title(label)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    fig.suptitle(f"{title} | sample_idx={sample_idx}")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(save_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_group_overview(
     group_id: int,
     sample_indices: np.ndarray,
@@ -191,6 +428,9 @@ def plot_group_overview(
     dt: float,
     save_path: str,
     total_group_size: int,
+    artificial_pred_traj: Optional[np.ndarray] = None,
+    artificial_token: Optional[int] = None,
+    artificial_count: Optional[int] = None,
 ) -> None:
     if sample_indices.size == 0:
         return
@@ -201,14 +441,29 @@ def plot_group_overview(
     pred_xy = pred_prof["xy"]
 
     n = int(sample_indices.size)
-    cols = min(4, n)
-    rows = int(math.ceil(n / cols))
+    total_panels = n + (1 if artificial_pred_traj is not None else 0)
+    cols = min(4, total_panels)
+    rows = int(math.ceil(total_panels / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(4.4 * cols, 3.8 * rows), squeeze=False)
     flat_axes = axes.reshape(-1)
 
     for i, ax in enumerate(flat_axes):
-        if i >= n:
+        if i >= total_panels:
             ax.axis("off")
+            continue
+        if i == n and artificial_pred_traj is not None:
+            artificial_xy = compute_kinematic_profiles(artificial_pred_traj[None, ...], dt=dt)["xy"][0]
+            ax.plot(artificial_xy[:, 0], artificial_xy[:, 1], linewidth=2.4, linestyle="--", label="Artificial recon")
+            ax.scatter(artificial_xy[0, 0], artificial_xy[0, 1], c="green", s=18)
+            ax.scatter(artificial_xy[-1, 0], artificial_xy[-1, 1], c="orange", s=18)
+            ax.set_title(
+                f"mode first token={artificial_token}\n"
+                f"count={artificial_count}/{total_group_size}, only layer-1 used",
+                fontsize=9,
+            )
+            ax.grid(True, alpha=0.3)
+            ax.axis("equal")
+            ax.legend(fontsize=8)
             continue
         ax.plot(gt_xy[i, :, 0], gt_xy[i, :, 1], linewidth=2.0, label="GT")
         ax.plot(pred_xy[i, :, 0], pred_xy[i, :, 1], linewidth=2.0, linestyle="--", label="Recon")
@@ -278,8 +533,28 @@ def main() -> None:
         clip_limit=norm_params["clip_limit"],
         batch_size=int(args.batch_size),
     )
+    artificial_traj, artificial_token, artificial_count = decode_group_mode_first_token(
+        model=model,
+        codes=codes,
+        norm_params=norm_params,
+    )
+    print(
+        f"Artificial token recon: first_token_mode={artificial_token} "
+        f"({artificial_count}/{int(group_indices.size)}), decode with only this token."
+    )
 
     metrics = compute_reconstruction_case_metrics(group_trajs, recon_trajs, dt=float(args.dt))
+    if resolved_model_type == "taae":
+        train_loss_metrics = compute_train_style_loss_components(
+            model=model,
+            trajs=group_trajs,
+            norm_params=norm_params,
+            batch_size=int(args.batch_size),
+            loss_epoch=int(args.loss_epoch),
+        )
+        metrics.update(train_loss_metrics)
+    else:
+        print("[warning] train_tfm.py weighted loss columns are only implemented for model_type=taae; skipping them.")
     target_positions = np.where(group_indices == int(args.sample_idx))[0]
     target_pos = int(target_positions[0])
 
@@ -295,6 +570,27 @@ def main() -> None:
                 "ade": row_metrics["ade"],
                 "fde": row_metrics["fde"],
                 "max_error": row_metrics["max_error"],
+                **{
+                    key: row_metrics[key]
+                    for key in [
+                        "train_recon_loss",
+                        "train_vq_loss",
+                        "train_vel_loss",
+                        "train_acc_loss",
+                        "train_kin_smooth_loss",
+                        "train_turn_global_loss",
+                        "train_turn_yaw_loss",
+                        "weight_recon",
+                        "weight_vq",
+                        "weight_vel",
+                        "weight_acc",
+                        "weight_kin_smooth",
+                        "weight_turn_global",
+                        "weight_turn_yaw",
+                        "weight",
+                    ]
+                    if key in row_metrics
+                },
                 "tokens": token_sequence_to_str(codes[pos]),
             }
         )
@@ -327,6 +623,20 @@ def main() -> None:
     for name in ["recon_mse", "ade", "fde", "max_error"]:
         s = stats[name]
         print(f"  {name}: mean={s['mean']:.6f}, min={s['min']:.6f}, max={s['max']:.6f}")
+    if "weight" in metrics:
+        print("\nTrain-style weighted loss stats:")
+        for name in [
+            "weight_recon",
+            "weight_vq",
+            "weight_vel",
+            "weight_acc",
+            "weight_kin_smooth",
+            "weight_turn_global",
+            "weight_turn_yaw",
+            "weight",
+        ]:
+            s = stats[name]
+            print(f"  {name}: target={target_metrics[name]:.6f}, mean={s['mean']:.6f}, min={s['min']:.6f}, max={s['max']:.6f}")
     print("\nTarget rank within group (1 = worst/highest loss):")
     print(
         f"  recon_mse: {ranks['recon_mse']}/{int(group_indices.size)} | "
@@ -350,6 +660,19 @@ def main() -> None:
             metrics=metric_at(metrics, pos),
         )
 
+    # 人工 token 图单独保存，避免覆盖正常的 group_{gid}_sample_{idx}.png。
+    artificial_sample_path = os.path.join(
+        args.out_dir,
+        f"group_{group_id}_sample_artificial_token.png",
+    )
+    plot_recon_only_case(
+        sample_idx=int(args.sample_idx),
+        pred_traj=artificial_traj,
+        dt=float(args.dt),
+        save_path=artificial_sample_path,
+        title=f"Group {group_id} artificial first-token recon [{artificial_token}]",
+    )
+
     if vis_indices.size > 0:
         vis_positions = np.asarray([pos_by_sample[int(v)] for v in vis_indices.tolist()], dtype=np.int64)
         overview_metrics = {name: values[vis_positions] for name, values in metrics.items()}
@@ -363,6 +686,9 @@ def main() -> None:
             dt=float(args.dt),
             save_path=overview_path,
             total_group_size=int(group_indices.size),
+            artificial_pred_traj=artificial_traj,
+            artificial_token=artificial_token,
+            artificial_count=artificial_count,
         )
 
     summary = {
@@ -382,6 +708,9 @@ def main() -> None:
         "group_loss_stats": stats,
         "target_rank_desc": ranks,
         "visualized_sample_indices": [int(v) for v in vis_indices.tolist()],
+        "artificial_first_token": int(artificial_token),
+        "artificial_first_token_count": int(artificial_count),
+        "artificial_token_plot_path": os.path.abspath(artificial_sample_path),
     }
     summary_path = os.path.join(args.out_dir, "group_case_analysis_summary.json")
     write_json(summary_path, summary)
