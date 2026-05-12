@@ -366,6 +366,47 @@ def _soft_primary_code_consistency_loss(
     return torch.stack(losses).mean()
 
 
+def _hard_code_consistency_loss(
+    model: TrajRVQTransformer,
+    z_or_z_pooled: torch.Tensor,
+    labels: torch.Tensor,
+    num_layers: int,
+    temperature: float,
+) -> torch.Tensor:
+    """让同 group 样本的前若干层 RVQ hard token 向 anchor token 对齐。"""
+    if int(num_layers) <= 0 or z_or_z_pooled.shape[0] <= 1:
+        return z_or_z_pooled.new_zeros(())
+    if not hasattr(model.rvq, "forward_with_distances"):
+        return z_or_z_pooled.new_zeros(())
+
+    _, _, all_codes, all_dists = model.rvq.forward_with_distances(z_or_z_pooled)
+    if all_codes is None or len(all_dists) == 0:
+        return z_or_z_pooled.new_zeros(())
+    if all_codes.ndim != 2 or any(dist.ndim != 2 for dist in all_dists):
+        return z_or_z_pooled.new_zeros(())
+
+    L = min(int(num_layers), int(all_codes.shape[1]), len(all_dists))
+    if L <= 0:
+        return z_or_z_pooled.new_zeros(())
+
+    losses = []
+    temp = max(float(temperature), 1e-6)
+    for lab in torch.unique(labels).tolist():
+        idx = torch.where(labels == int(lab))[0]
+        if int(idx.numel()) < 2:
+            continue
+        anchor_idx = idx[0]
+        member_idx = idx[1:]
+        for layer_idx in range(L):
+            target_code = all_codes[anchor_idx, layer_idx].detach().expand(member_idx.numel())
+            logits = -all_dists[layer_idx][member_idx] / temp
+            losses.append(F.cross_entropy(logits.float(), target_code.long()))
+
+    if not losses:
+        return z_or_z_pooled.new_zeros(())
+    return torch.stack(losses).mean()
+
+
 def train_rvq_taae_with_group_consistency(
     base_train_trajs: np.ndarray,
     all_trajs: np.ndarray,
@@ -383,10 +424,13 @@ def train_rvq_taae_with_group_consistency(
     lambda_latent_consistency: float,
     lambda_soft_code_consistency: float,
     lambda_supcon: float,
+    lambda_hard_code_consistency: float,
     contrastive_temperature: float,
     soft_code_temperature: float,
+    hard_code_temperature: float,
     consistency_warmup_epochs: int,
     consistency_target: str,
+    hard_code_consistency_layers: int,
     seed: int,
 ) -> List[Dict[str, float]]:
     """similar_consistency 实验训练：base loss + 动态采样 consistency loss。"""
@@ -488,11 +532,19 @@ def train_rvq_taae_with_group_consistency(
             warmup_weight = min(1.0, float(epoch) / float(consistency_warmup_epochs))
 
         total_loss_sum = 0.0
+        base_weight_sum = 0.0
+        weighted_consistency_sum = 0.0
         recon_sum = 0.0
         vq_sum = 0.0
+        vel_sum = 0.0
+        acc_sum = 0.0
+        kin_smooth_sum = 0.0
+        turn_global_sum = 0.0
+        turn_yaw_sum = 0.0
         latent_sum = 0.0
         soft_sum = 0.0
         supcon_sum = 0.0
+        hard_code_sum = 0.0
         n_batches = 0
 
         for batch in dataloader:
@@ -516,6 +568,7 @@ def train_rvq_taae_with_group_consistency(
                 latent_loss = x_norm.new_zeros(())
                 soft_loss = x_norm.new_zeros(())
                 supcon_loss = x_norm.new_zeros(())
+                hard_code_loss = x_norm.new_zeros(())
 
                 if c_trajs_np.shape[0] > 1:
                     c_x_phys = torch.tensor(c_trajs_np, dtype=torch.float32, device=device)
@@ -545,11 +598,20 @@ def train_rvq_taae_with_group_consistency(
                         labels=c_labels,
                         temperature=contrastive_temperature,
                     )
+                    if float(lambda_hard_code_consistency) > 0.0:
+                        hard_code_loss = _hard_code_consistency_loss(
+                            model=model,
+                            z_or_z_pooled=z_pooled,
+                            labels=c_labels,
+                            num_layers=hard_code_consistency_layers,
+                            temperature=hard_code_temperature,
+                        )
 
                 consistency_term = (
                     float(lambda_latent_consistency) * latent_loss
                     + float(lambda_soft_code_consistency) * soft_loss
                     + float(lambda_supcon) * supcon_loss
+                    + float(lambda_hard_code_consistency) * hard_code_loss
                 )
                 total_loss = base_loss + warmup_weight * consistency_term
 
@@ -565,24 +627,56 @@ def train_rvq_taae_with_group_consistency(
                 optimizer.step()
 
             total_loss_sum += float(total_loss.item())
+            base_weight_sum += float(base_loss.item())
+            weighted_consistency_sum += float((warmup_weight * consistency_term).item())
             recon_sum += float(base_terms["recon_loss"].item())
             vq_sum += float(base_terms["vq_loss"].item())
+            vel_sum += float(base_terms["vel_loss"].item())
+            acc_sum += float(base_terms["acc_loss"].item())
+            kin_smooth_sum += float(base_terms["kin_smooth_loss"].item())
+            turn_global_sum += float(base_terms["turn_global_loss"].item())
+            turn_yaw_sum += float(base_terms["turn_yaw_loss"].item())
             latent_sum += float(latent_loss.item())
             soft_sum += float(soft_loss.item())
             supcon_sum += float(supcon_loss.item())
+            hard_code_sum += float(hard_code_loss.item())
             n_batches += 1
 
         scheduler.step()
 
         denom = max(1, n_batches)
+        avg_recon = recon_sum / denom
+        avg_vq = vq_sum / denom
+        avg_vel = vel_sum / denom
+        avg_acc = acc_sum / denom
+        avg_kin_smooth = kin_smooth_sum / denom
+        avg_turn_global = turn_global_sum / denom
+        avg_turn_yaw = turn_yaw_sum / denom
+        kin_smooth_weight = 1e-2 if epoch > 30 else 0.0
         row = {
             "epoch": int(epoch + 1),
             "total_loss": total_loss_sum / denom,
-            "recon_loss": recon_sum / denom,
-            "vq_loss": vq_sum / denom,
+            "base_weight_loss": base_weight_sum / denom,
+            "weighted_consistency_loss": weighted_consistency_sum / denom,
+            "recon_loss": avg_recon,
+            "vq_loss": avg_vq,
+            "vel_loss": avg_vel,
+            "acc_loss": avg_acc,
+            "kin_smooth_loss": avg_kin_smooth,
+            "turn_global_loss": avg_turn_global,
+            "turn_yaw_loss": avg_turn_yaw,
+            "weight_recon": 10.0 * avg_recon,
+            "weight_vq": 5.0 * avg_vq,
+            "weight_vel": 0.5 * avg_vel,
+            "weight_acc": 0.05 * avg_acc,
+            "weight_kin_smooth": kin_smooth_weight * avg_kin_smooth,
+            "weight_turn_global": avg_turn_global,
+            "weight_turn_yaw": 2.0 * avg_turn_yaw,
             "latent_consistency_loss": latent_sum / denom,
             "soft_code_consistency_loss": soft_sum / denom,
             "supcon_loss": supcon_sum / denom,
+            "hard_code_consistency_loss": hard_code_sum / denom,
+            "weight_hard_code_consistency": float(lambda_hard_code_consistency) * (hard_code_sum / denom),
             "warmup_weight": float(warmup_weight),
         }
         history.append(row)
@@ -590,18 +684,31 @@ def train_rvq_taae_with_group_consistency(
         writer.add_scalar("loss/total", row["total_loss"], epoch + 1)
         writer.add_scalar("loss/recon", row["recon_loss"], epoch + 1)
         writer.add_scalar("loss/vq", row["vq_loss"], epoch + 1)
+        writer.add_scalar("loss/weight_recon", row["weight_recon"], epoch + 1)
+        writer.add_scalar("loss/weight_vq", row["weight_vq"], epoch + 1)
+        writer.add_scalar("loss/weight_vel", row["weight_vel"], epoch + 1)
+        writer.add_scalar("loss/weight_acc", row["weight_acc"], epoch + 1)
+        writer.add_scalar("loss/weight_kin_smooth", row["weight_kin_smooth"], epoch + 1)
+        writer.add_scalar("loss/weight_turn_global", row["weight_turn_global"], epoch + 1)
+        writer.add_scalar("loss/weight_turn_yaw", row["weight_turn_yaw"], epoch + 1)
+        writer.add_scalar("loss/weight", row["base_weight_loss"], epoch + 1)
+        writer.add_scalar("loss/weight_consistency", row["weighted_consistency_loss"], epoch + 1)
         writer.add_scalar("loss/latent_consistency", row["latent_consistency_loss"], epoch + 1)
         writer.add_scalar("loss/soft_code_consistency", row["soft_code_consistency_loss"], epoch + 1)
         writer.add_scalar("loss/supcon", row["supcon_loss"], epoch + 1)
+        writer.add_scalar("loss/hard_code_consistency", row["hard_code_consistency_loss"], epoch + 1)
+        writer.add_scalar("loss/weight_hard_code_consistency", row["weight_hard_code_consistency"], epoch + 1)
         writer.add_scalar("loss/warmup_weight", row["warmup_weight"], epoch + 1)
 
         if (epoch + 1) % 10 == 0 or epoch == 0 or (epoch + 1) == epochs:
             print(
                 f"[SimilarConsistency] Epoch {epoch+1:03d} | total={row['total_loss']:.5f} | "
+                f"weight={row['base_weight_loss']:.5f} | consistency_w={row['weighted_consistency_loss']:.5f} | "
                 f"recon={row['recon_loss']:.5f} | vq={row['vq_loss']:.5f} | "
                 f"latent={row['latent_consistency_loss']:.5f} | "
                 f"soft={row['soft_code_consistency_loss']:.5f} | "
-                f"supcon={row['supcon_loss']:.5f} | warmup={row['warmup_weight']:.3f}"
+                f"supcon={row['supcon_loss']:.5f} | hard={row['hard_code_consistency_loss']:.5f} | "
+                f"warmup={row['warmup_weight']:.3f}"
             )
 
     torch.save(model.state_dict(), os.path.join(save_dir, f"{data_type}_rvq_taae_model.pth"))
@@ -1090,8 +1197,11 @@ def main() -> None:
     parser.add_argument("--lambda-latent-consistency", type=float, default=0.05)
     parser.add_argument("--lambda-soft-code-consistency", type=float, default=0.05)
     parser.add_argument("--lambda-supcon", type=float, default=0.05)
+    parser.add_argument("--lambda-hard-code-consistency", type=float, default=0.0)
     parser.add_argument("--contrastive-temperature", type=float, default=0.1)
     parser.add_argument("--soft-code-temperature", type=float, default=0.2)
+    parser.add_argument("--hard-code-temperature", type=float, default=0.2)
+    parser.add_argument("--hard-code-consistency-layers", type=int, default=1)
     parser.add_argument("--consistency-warmup-epochs", type=int, default=20)
     parser.add_argument(
         "--consistency-target",
@@ -1364,10 +1474,13 @@ def main() -> None:
             lambda_latent_consistency=float(args.lambda_latent_consistency),
             lambda_soft_code_consistency=float(args.lambda_soft_code_consistency),
             lambda_supcon=float(args.lambda_supcon),
+            lambda_hard_code_consistency=float(args.lambda_hard_code_consistency),
             contrastive_temperature=float(args.contrastive_temperature),
             soft_code_temperature=float(args.soft_code_temperature),
+            hard_code_temperature=float(args.hard_code_temperature),
             consistency_warmup_epochs=int(args.consistency_warmup_epochs),
             consistency_target=args.consistency_target,
+            hard_code_consistency_layers=int(args.hard_code_consistency_layers),
             seed=int(args.seed),
         )
 
@@ -1485,6 +1598,20 @@ def main() -> None:
         "train_data_source": train_data_source,
         "epochs": int(args.epochs),
         "batch_size": int(train_batch_size),
+        "consistency_train_base": args.consistency_train_base,
+        "positive_groups_per_step": int(args.positive_groups_per_step),
+        "positives_per_group": int(args.positives_per_group),
+        "negative_groups_per_step": int(args.negative_groups_per_step),
+        "lambda_latent_consistency": float(args.lambda_latent_consistency),
+        "lambda_soft_code_consistency": float(args.lambda_soft_code_consistency),
+        "lambda_supcon": float(args.lambda_supcon),
+        "lambda_hard_code_consistency": float(args.lambda_hard_code_consistency),
+        "contrastive_temperature": float(args.contrastive_temperature),
+        "soft_code_temperature": float(args.soft_code_temperature),
+        "hard_code_temperature": float(args.hard_code_temperature),
+        "consistency_warmup_epochs": int(args.consistency_warmup_epochs),
+        "consistency_target": args.consistency_target,
+        "hard_code_consistency_layers": int(args.hard_code_consistency_layers),
     }
 
     summary = {
@@ -1528,3 +1655,35 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# python /home/an.huang3/VQ-VAE/rvq_transformer_vehdyn/experiment_similar_traj_single_train.py \
+#   --experiment-mode similar_consistency \
+#   --consistency-train-base representative_group \
+#   --grouping-method minibatch_kmeans \
+#   --grouping-stage scenario_first \
+#   --group-feature kinematic_plus_shape \
+#   --num-representative-groups 80000 \
+#   --shape-downsample-steps 6 \
+#   --kmeans-batch-size 100000 \
+#   --kmeans-max-iter 20 \
+#   --kmeans-n-init 1 \
+#   --positive-groups-per-step 16 \
+#   --positives-per-group 6 \
+#   --negative-groups-per-step 8 \
+#   --lambda-latent-consistency 0.1 \
+#   --lambda-soft-code-consistency 0.1 \
+#   --lambda-supcon 0.0 \
+#   --lambda-hard-code-consistency 0.05 \
+#   --contrastive-temperature 0.1 \
+#   --soft-code-temperature 0.2 \
+#   --hard-code-temperature 0.2 \
+#   --hard-code-consistency-layers 1 \
+#   --consistency-warmup-epochs 100 \
+#   --consistency-target latent_plus_soft_code \
+#   --num-layers 6 \
+#   --epochs 500 \
+#   --report-similar-or \
+#   --report-noise-or \
+#   --num-group-visualizations 6 \
+#   --max-members-per-group-vis 12 \
+#   --output-dir /home/an.huang3/VQ-VAE/rvq_transformer_vehdyn/work_dirs/tokenizer/similar_consistency_repbase
