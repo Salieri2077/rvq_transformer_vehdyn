@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import os
 import pickle
 import time
@@ -82,6 +83,91 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _build_group_to_indices_local(group_id_per_sample: np.ndarray, num_groups: int) -> List[np.ndarray]:
+    order = np.argsort(group_id_per_sample, kind="mergesort")
+    labels_sorted = group_id_per_sample[order]
+    groups: List[np.ndarray] = [np.zeros((0,), dtype=np.int64) for _ in range(int(num_groups))]
+    if order.size == 0:
+        return groups
+    boundaries = np.flatnonzero(np.diff(labels_sorted)) + 1
+    starts = np.concatenate([[0], boundaries])
+    ends = np.concatenate([boundaries, [order.size]])
+    for s, e in zip(starts.tolist(), ends.tolist()):
+        gid = int(labels_sorted[s])
+        groups[gid] = order[s:e].astype(np.int64)
+    return groups
+
+
+def _load_group_unique_source_indices(path: str, n_total: int):
+    """
+    可选的分组去重映射：source_indices[new_row] = 原始数据行号。
+    KMeans 只看每个原始行号的第一条轨迹，之后再把 group_id 扩展回全量增强数据。
+    """
+    if not str(path).strip():
+        return None, None, None
+    source_indices = np.load(path).astype(np.int64).reshape(-1)
+    if source_indices.shape[0] != int(n_total):
+        raise ValueError(
+            f"--group-unique-source-indices length mismatch: {source_indices.shape[0]} vs data N={n_total}"
+        )
+    _, unique_first_rows, unique_inverse = np.unique(
+        source_indices, return_index=True, return_inverse=True
+    )
+    return source_indices, unique_first_rows.astype(np.int64), unique_inverse.astype(np.int64)
+
+
+def _unique_source_cache_suffix(path: str, n_total: int, unique_count: int) -> str:
+    st = os.stat(path)
+    payload = {
+        "path": os.path.abspath(path),
+        "size": int(st.st_size),
+        "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
+        "n_total": int(n_total),
+        "unique_count": int(unique_count),
+    }
+    digest = hashlib.md5(str(sorted(payload.items())).encode("utf-8")).hexdigest()[:10]
+    return f"uniqsrc_{digest}"
+
+
+def _cache_matches_key(grouping: Optional[Dict[str, object]], cache_key: str, require_key: bool) -> bool:
+    if grouping is None:
+        return False
+    existing = str(grouping.get("cache_key", ""))
+    if not existing and not require_key:
+        return True
+    return existing == str(cache_key)
+
+
+def _expand_unique_source_grouping(
+    grouping: Dict[str, object],
+    unique_first_rows: np.ndarray,
+    unique_inverse: np.ndarray,
+    n_total: int,
+) -> Dict[str, object]:
+    """把 unique-row 的聚类结果扩展回增强后的全量 row index。"""
+    unique_gid = np.asarray(grouping["group_id_per_sample"], dtype=np.int32)
+    group_id_per_sample = unique_gid[unique_inverse].astype(np.int32)
+    actual_num_groups = int(grouping["actual_num_groups"])
+    group_to_indices = _build_group_to_indices_local(group_id_per_sample, actual_num_groups)
+    group_sizes = np.asarray([g.size for g in group_to_indices], dtype=np.int64)
+
+    representative_unique = np.asarray(grouping["representative_indices"], dtype=np.int64)
+    representative_indices = unique_first_rows[representative_unique].astype(np.int64)
+
+    out = dict(grouping)
+    out.update({
+        "group_id_per_sample": group_id_per_sample,
+        "representative_indices": representative_indices,
+        "group_sizes": group_sizes,
+        "group_to_indices": group_to_indices,
+        "actual_num_groups": actual_num_groups,
+        "grouping_method_used": f"{grouping.get('grouping_method_used', 'unknown')}_unique_source",
+        "unique_source_input_count": int(unique_first_rows.shape[0]),
+        "expanded_raw_count": int(n_total),
+    })
+    return out
 
 
 
@@ -1228,6 +1314,12 @@ def main() -> None:
     parser.add_argument("--grouping-cache-dir", type=str, default=None)
     parser.add_argument("--disable-grouping-cache", action="store_true")
     parser.add_argument("--grouping-cache-key", type=str, default="")
+    parser.add_argument(
+        "--group-unique-source-indices",
+        type=str,
+        default="",
+        help="Optional source-index sidecar from filter_group_loss_outliers.py; KMeans groups unique source rows only.",
+    )
 
     args = parser.parse_args()
 
@@ -1243,10 +1335,27 @@ def main() -> None:
     trajs = np.asarray(trajs, dtype=np.float32)
 
     n_total = int(trajs.shape[0])
-    requested_num_groups = int(max(1, min(args.num_representative_groups, n_total)))
 
     motion_stats = compute_motion_stats(trajs, dt=float(args.dt))
     _print_dataset_summary(motion_stats, num_steps=int(trajs.shape[1]))
+
+    source_indices, unique_first_rows, unique_inverse = _load_group_unique_source_indices(
+        args.group_unique_source_indices, n_total=n_total
+    )
+    if source_indices is not None:
+        grouping_trajs = trajs[unique_first_rows]
+        grouping_motion_stats = compute_motion_stats(grouping_trajs, dt=float(args.dt))
+        grouping_input_count = int(unique_first_rows.shape[0])
+        print(
+            f"[grouping] unique-source mode: KMeans input {grouping_input_count} unique rows "
+            f"from {n_total} augmented rows."
+        )
+    else:
+        grouping_trajs = trajs
+        grouping_motion_stats = motion_stats
+        grouping_input_count = n_total
+
+    requested_num_groups = int(max(1, min(args.num_representative_groups, grouping_input_count)))
 
     grouping = None
     grouping_loaded_from_cache = False
@@ -1273,17 +1382,26 @@ def main() -> None:
             kmeans_random_state=int(args.kmeans_random_state),
             seed=int(args.seed),
         )
+        if source_indices is not None:
+            cache_key = f"{cache_key}_{_unique_source_cache_suffix(args.group_unique_source_indices, n_total, grouping_input_count)}"
 
     grouping_cache_root = args.grouping_cache_dir or os.path.join(args.save_root, "grouping_cache")
     grouping_cache_dir = os.path.join(grouping_cache_root, cache_key)
 
+    require_cache_key = source_indices is not None
     if not args.disable_grouping_cache:
         grouping = try_load_grouping_from_cache(output_dir, n_total=n_total)
+        if grouping is not None and not _cache_matches_key(grouping, cache_key, require_key=require_cache_key):
+            print(f"[cache] Ignored stale grouping in output_dir: {output_dir}")
+            grouping = None
         if grouping is not None:
             grouping_loaded_from_cache = True
             print(f"[cache] Loaded grouping from output_dir: {output_dir}")
         else:
             grouping = try_load_grouping_from_cache(grouping_cache_dir, n_total=n_total)
+            if grouping is not None and not _cache_matches_key(grouping, cache_key, require_key=require_cache_key):
+                print(f"[cache] Ignored stale grouping in cache_dir: {grouping_cache_dir}")
+                grouping = None
             if grouping is not None:
                 grouping_loaded_from_cache = True
                 print(f"[cache] Loaded grouping from cache_dir: {grouping_cache_dir}")
@@ -1291,7 +1409,7 @@ def main() -> None:
     if grouping is None:
         # 分组核心流程：按配置选择全局分组或“先场景后分组”。
         grouping = find_representative_groups(
-            trajs=trajs,
+            trajs=grouping_trajs,
             dt=float(args.dt),
             num_groups=requested_num_groups,
             grouping_method=args.grouping_method,
@@ -1305,8 +1423,15 @@ def main() -> None:
             kmeans_n_init=int(args.kmeans_n_init),
             kmeans_random_state=int(args.kmeans_random_state),
             seed=int(args.seed),
-            motion_stats=motion_stats,
+            motion_stats=grouping_motion_stats,
         )
+        if source_indices is not None:
+            grouping = _expand_unique_source_grouping(
+                grouping=grouping,
+                unique_first_rows=unique_first_rows,
+                unique_inverse=unique_inverse,
+                n_total=n_total,
+            )
 
         if not args.disable_grouping_cache:
             cache_meta = {
@@ -1319,6 +1444,9 @@ def main() -> None:
                 "raw_count": int(n_total),
                 "num_steps": int(trajs.shape[1]),
                 "requested_num_groups": int(requested_num_groups),
+                "group_unique_source_indices_path": os.path.abspath(args.group_unique_source_indices) if source_indices is not None else "",
+                "grouping_input_count": int(grouping_input_count),
+                "grouping_expanded_to_raw_count": bool(source_indices is not None),
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             save_grouping_cache(output_dir, grouping, meta=cache_meta)
@@ -1337,6 +1465,9 @@ def main() -> None:
                 "raw_count": int(n_total),
                 "num_steps": int(trajs.shape[1]),
                 "requested_num_groups": int(requested_num_groups),
+                "group_unique_source_indices_path": os.path.abspath(args.group_unique_source_indices) if source_indices is not None else "",
+                "grouping_input_count": int(grouping_input_count),
+                "grouping_expanded_to_raw_count": bool(source_indices is not None),
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "loaded_from_cache": True,
             }
@@ -1386,6 +1517,9 @@ def main() -> None:
         "loaded_from_cache": bool(grouping_loaded_from_cache),
         "cache_key": cache_key,
         "grouping_cache_dir": grouping_cache_dir,
+        "group_unique_source_indices_path": os.path.abspath(args.group_unique_source_indices) if source_indices is not None else "",
+        "grouping_input_count": int(grouping_input_count),
+        "grouping_expanded_to_raw_count": bool(source_indices is not None),
         "scenario_partition_summary": scenario_partition_summary,
         "group_size_percentiles": _percentiles(group_sizes.astype(np.float32)),
         "representative_distance_to_center_percentiles": _percentiles(rep_dist.astype(np.float32)),

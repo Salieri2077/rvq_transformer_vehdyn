@@ -139,6 +139,7 @@ def try_load_grouping_from_cache(
 
     grouping_method_used = "cache"
     grouping_stage_used = "unknown"
+    meta = {}
     if os.path.exists(meta_path):
         try:
             with open(meta_path, "r") as f:
@@ -157,6 +158,8 @@ def try_load_grouping_from_cache(
         "actual_num_groups": actual_num_groups,
         "grouping_method_used": grouping_method_used,
         "grouping_stage_used": grouping_stage_used,
+        "cache_key": str(meta.get("cache_key", "")),
+        "cache_meta": meta,
         "scenario_partition_summary": [],
     }
 

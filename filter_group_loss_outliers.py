@@ -68,6 +68,11 @@ def default_out_path(data_path):
     return f"{root}_group_loss_filtered{ext or '.npy'}"
 
 
+def source_indices_sidecar_path(out_path):
+    root, _ = os.path.splitext(out_path)
+    return f"{root}_source_indices.npy"
+
+
 def save_by_indices(data, indices, out_path, n_total):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     if isinstance(data, dict) and "trajs" in data:
@@ -278,6 +283,9 @@ def main():
     output_indices = np.concatenate([kept_indices, append_indices], axis=0)
 
     save_by_indices(data, output_indices, out_path, n_total=n_total)
+    source_indices_path = source_indices_sidecar_path(out_path)
+    # source_indices_path 是稳定映射：filtered_data[new_row] 来自原始数据的哪一行。
+    np.save(source_indices_path, output_indices.astype(np.int64))
 
     np.save(os.path.join(out_dir, "kept_indices.npy"), kept_indices)
     np.save(os.path.join(out_dir, "removed_indices.npy"), removed_indices)
@@ -319,6 +327,7 @@ def main():
         "num_hard_samples_duplicated": int(duplicate_indices.size),
         "duplicate_hard_count": duplicate_count,
         "num_output": int(output_indices.size),
+        "source_indices_path": os.path.abspath(source_indices_path),
         "removed_ratio": float(removed_indices.size / max(n_total, 1)),
         "min_group_size": int(args.min_group_size),
         "ratio_threshold": float(args.ratio_threshold),
@@ -337,6 +346,7 @@ def main():
     print(f"Removed samples: {removed_indices.size} / {n_total} ({summary['removed_ratio']:.6f})")
     print(f"Duplicated hard samples: {duplicate_indices.size} unique x {duplicate_count} extra copies")
     print(f"Output samples: {output_indices.size}")
+    print(f"Saved source-index sidecar to: {source_indices_path}")
     print(f"Saved removed detail csv to: {removed_csv}")
     print(f"Saved duplicated detail csv to: {duplicated_csv}")
     print(f"Saved summary to: {summary_path}")

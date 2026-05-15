@@ -55,6 +55,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_group_vis", "--max-group-vis", dest="max_group_vis", type=int, default=16)
 
     parser.add_argument("--group_cache_key", "--group-cache-key", dest="group_cache_key", type=str, default="")
+    parser.add_argument("--source_indices_path", "--source-indices-path", dest="source_indices_path", type=str, default="")
+    parser.add_argument(
+        "--sample_idx_is_source",
+        "--sample-idx-is-source",
+        dest="sample_idx_is_source",
+        action="store_true",
+        help="Treat --sample_idx as the original/source row id and locate its row in the filtered data.",
+    )
+    parser.add_argument("--source_occurrence", "--source-occurrence", dest="source_occurrence", type=int, default=0)
     parser.add_argument("--model_type", "--model-type", dest="model_type", default="auto", choices=["auto", "taae", "accint"])
     parser.add_argument("--data_type", "--data-type", dest="data_type", default="pred", choices=["pred", "history"])
     parser.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=4096)
@@ -497,15 +506,51 @@ def main() -> None:
         trajs = trajs[:, :14, :]
 
     n_total = int(trajs.shape[0])
+
+    requested_sample_idx = int(args.sample_idx)
+    target_sample_idx = requested_sample_idx
+    source_indices = None
+    source_match_indices = np.asarray([], dtype=np.int64)
+    if bool(args.sample_idx_is_source):
+        if not str(args.source_indices_path).strip():
+            raise ValueError("--sample_idx_is_source requires --source_indices_path.")
+        source_indices = np.load(args.source_indices_path).astype(np.int64).reshape(-1)
+        if source_indices.shape[0] != n_total:
+            raise ValueError(
+                f"source_indices length mismatch: {source_indices.shape[0]} vs data N={n_total}"
+            )
+        source_match_indices = np.where(source_indices == requested_sample_idx)[0].astype(np.int64)
+        if source_match_indices.size == 0:
+            raise ValueError(
+                f"original/source sample_idx={requested_sample_idx} was not found in filtered data. "
+                "It may have been removed as an outlier."
+            )
+        occurrence = int(args.source_occurrence)
+        if occurrence < 0 or occurrence >= source_match_indices.size:
+            raise IndexError(
+                f"--source_occurrence={occurrence} out of range for source sample "
+                f"{requested_sample_idx}; found {source_match_indices.size} rows."
+            )
+        target_sample_idx = int(source_match_indices[occurrence])
+
     cache_dir, grouping = load_grouping_cache(
         group_cache_dir=args.group_cache_dir,
         group_cache_key=args.group_cache_key,
         n_total=n_total,
     )
-    group_id, group_indices = find_sample_group(grouping, sample_idx=int(args.sample_idx))
+    group_id, group_indices = find_sample_group(grouping, sample_idx=target_sample_idx)
 
     print(f"Loaded grouping cache: {cache_dir}")
-    print(f"target sample_idx: {int(args.sample_idx)}")
+    if bool(args.sample_idx_is_source):
+        print(f"target source sample_idx: {requested_sample_idx}")
+        print(
+            f"target current sample_idx: {target_sample_idx} "
+            f"(occurrence {int(args.source_occurrence) + 1}/{int(source_match_indices.size)})"
+        )
+        print("all current rows for this source sample_idx:")
+        print(",".join(str(int(v)) for v in source_match_indices.tolist()))
+    else:
+        print(f"target sample_idx: {target_sample_idx}")
     print(f"group_id: {group_id}")
     print(f"group size: {int(group_indices.size)}")
     print("group sample_idx list:")
@@ -555,7 +600,7 @@ def main() -> None:
         metrics.update(train_loss_metrics)
     else:
         print("[warning] train_tfm.py weighted loss columns are only implemented for model_type=taae; skipping them.")
-    target_positions = np.where(group_indices == int(args.sample_idx))[0]
+    target_positions = np.where(group_indices == int(target_sample_idx))[0]
     target_pos = int(target_positions[0])
 
     rows = []
@@ -565,7 +610,8 @@ def main() -> None:
             {
                 "group_id": int(group_id),
                 "sample_idx": int(sample_idx),
-                "is_target_case": int(int(sample_idx) == int(args.sample_idx)),
+                "source_sample_idx": int(source_indices[int(sample_idx)]) if source_indices is not None else "",
+                "is_target_case": int(int(sample_idx) == int(target_sample_idx)),
                 "recon_mse": row_metrics["recon_mse"],
                 "ade": row_metrics["ade"],
                 "fde": row_metrics["fde"],
@@ -644,7 +690,7 @@ def main() -> None:
         f"FDE: {ranks['fde']}/{int(group_indices.size)}"
     )
 
-    vis_indices = choose_visualization_indices(group_indices, int(args.sample_idx), int(args.max_group_vis))
+    vis_indices = choose_visualization_indices(group_indices, int(target_sample_idx), int(args.max_group_vis))
     pos_by_sample = {int(sample_idx): pos for pos, sample_idx in enumerate(group_indices.tolist())}
     for sample_idx in vis_indices.tolist():
         pos = pos_by_sample[int(sample_idx)]
@@ -666,7 +712,7 @@ def main() -> None:
         f"group_{group_id}_sample_artificial_token.png",
     )
     plot_recon_only_case(
-        sample_idx=int(args.sample_idx),
+        sample_idx=int(target_sample_idx),
         pred_traj=artificial_traj,
         dt=float(args.dt),
         save_path=artificial_sample_path,
@@ -692,7 +738,11 @@ def main() -> None:
         )
 
     summary = {
-        "sample_idx": int(args.sample_idx),
+        "requested_sample_idx": int(requested_sample_idx),
+        "sample_idx_is_source": bool(args.sample_idx_is_source),
+        "target_sample_idx": int(target_sample_idx),
+        "source_indices_path": os.path.abspath(args.source_indices_path) if source_indices is not None else "",
+        "source_match_indices": [int(v) for v in source_match_indices.tolist()],
         "group_id": int(group_id),
         "group_size": int(group_indices.size),
         "group_sample_indices": [int(v) for v in group_indices.tolist()],
@@ -726,10 +776,11 @@ if __name__ == "__main__":
 
 # Example:
 # python analyze_group_worst_case.py \
-#   --model_path /path/to/rvq_tfm_kin_0311/pred_rvq_taae_model.pth \
-#   --norm_path /path/to/rvq_tfm_kin_0311/pred_norm_params.pkl \
-#   --data_path /path/to/all_datas.npy \
-#   --sample_idx 12345 \
-#   --group_cache_dir /path/to/similar_single_train/grouping_cache \
-#   --out_dir /path/to/rvq_tfm_kin_0311/group_case_analysis \
-#   --max_group_vis 16
+#   --model_path /home/an.huang3/VQ-VAE/rvq_transformer_vehdyn/work_dirs/tokenizer/rvq_tfm_kin_0311/pred_rvq_taae_model.pth \
+#   --norm_path /home/an.huang3/VQ-VAE/rvq_transformer_vehdyn/work_dirs/tokenizer/rvq_tfm_kin_0311/pred_norm_params.pkl \
+#   --data_path /home/an.huang3/find_bin/work_dirs/dxdydyaw/all_datas_augmented_reverse_detour_directuturn_hs120_group_loss_filtered.npy \
+#   --sample_idx 971299 \
+#   --group_cache_dir /home/an.huang3/VQ-VAE/rvq_transformer_vehdyn/work_dirs/tokenizer/similar_single_train/grouping_cache \
+#   --out_dir /home/an.huang3/VQ-VAE/rvq_transformer_vehdyn/work_dirs/tokenizer/rvq_tfm_kin_0311/group_case_analysis \
+#   --max_group_vis 16 \
+#   --loss_epoch 31
