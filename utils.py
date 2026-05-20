@@ -111,6 +111,89 @@ def load_sampled_datas(data_path: str = None):
     return load_traj_array(data_path)
 
 
+def source_indices_sidecar_path(data_path: str) -> str:
+    """Return the conventional sidecar path storing source row ids."""
+    root, _ = os.path.splitext(str(data_path))
+    return f"{root}_source_indices.npy"
+
+
+def resolve_source_indices_path(data_path: str, source_indices_path: str = "") -> str:
+    """
+    Resolve a source-index sidecar path.
+
+    Explicit path wins. Otherwise, use the convention produced by
+    filter_group_loss_outliers.py when that file exists.
+    """
+    explicit = str(source_indices_path or "").strip()
+    if explicit:
+        return explicit
+    if not data_path:
+        return ""
+    candidate = source_indices_sidecar_path(data_path)
+    return candidate if os.path.exists(candidate) else ""
+
+
+def load_source_indices(source_indices_path: str, n_total: int = None) -> np.ndarray:
+    source_indices = np.load(source_indices_path).astype(np.int64).reshape(-1)
+    if n_total is not None and source_indices.shape[0] != int(n_total):
+        raise ValueError(
+            f"source_indices length mismatch: {source_indices.shape[0]} vs data N={int(n_total)}"
+        )
+    return source_indices
+
+
+def resolve_sample_idx(
+    n_total: int,
+    sample_idx: int = None,
+    source_sample_idx: int = None,
+    source_indices: np.ndarray = None,
+    source_occurrence: int = 0,
+) -> int:
+    """
+    Resolve the row to train on.
+
+    If source_indices is provided, source_sample_idx is interpreted as the
+    original/source row id and mapped to the selected row in the current data.
+    Without source_indices, source_sample_idx falls back to direct row indexing.
+    """
+    if sample_idx is not None:
+        idx = int(sample_idx)
+    elif source_sample_idx is not None and source_indices is not None:
+        matches = np.flatnonzero(np.asarray(source_indices).reshape(-1) == int(source_sample_idx))
+        if matches.size == 0:
+            raise ValueError(f"source_sample_idx={int(source_sample_idx)} not found in source_indices.")
+        occ = int(source_occurrence)
+        if occ < 0:
+            occ = int(matches.size) + occ
+        if occ < 0 or occ >= int(matches.size):
+            raise ValueError(
+                f"source_occurrence={int(source_occurrence)} out of range for "
+                f"{int(matches.size)} rows matching source_sample_idx={int(source_sample_idx)}."
+            )
+        idx = int(matches[occ])
+    elif source_sample_idx is not None:
+        idx = int(source_sample_idx)
+    else:
+        raise ValueError("Either sample_idx or source_sample_idx must be provided.")
+
+    if idx < 0 or idx >= int(n_total):
+        raise IndexError(f"sample_idx={idx} is out of range for data N={int(n_total)}")
+    return idx
+
+
+def build_repeated_single_sample_dataset(
+    trajs: np.ndarray,
+    sample_idx: int,
+    repeat_count: int,
+) -> np.ndarray:
+    """Build a tiny overfit dataset by repeating one trajectory row."""
+    count = int(repeat_count)
+    if count <= 0:
+        raise ValueError(f"repeat_count must be positive, got {repeat_count}")
+    idx = resolve_sample_idx(n_total=int(trajs.shape[0]), sample_idx=int(sample_idx))
+    return np.repeat(np.asarray(trajs[idx : idx + 1], dtype=np.float32), count, axis=0)
+
+
 def load_test_datas(data_path: str = None):
     if data_path is None:
         data_path = resolve_default_data_path()

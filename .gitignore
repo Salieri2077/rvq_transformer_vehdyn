@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Runtime outputs and experiment artifacts.
+work_dirs/
+tensorboard/
+*.log
+*.backup
+*.png
+*.csv
+*.json
+*.npy
+*.npz
+*.pkl
+*.pth
