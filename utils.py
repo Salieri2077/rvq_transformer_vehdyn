@@ -4,6 +4,11 @@ import os
 import json
 import csv
 
+try:
+    import matplotlib.pyplot as plt
+except Exception:  # pragma: no cover
+    plt = None
+
 from scipy.fft import dct, idct
 
 import torch
@@ -377,6 +382,132 @@ def compute_reconstruction_case_metrics(gt_trajs: np.ndarray, pred_trajs: np.nda
         "fde": step_dist_error[:, -1].astype(np.float64),
         "max_error": step_dist_error.max(axis=1).astype(np.float64),
     }
+
+
+def decode_token_prefix_reconstructions(model, codes, norm_params: dict, prefix_lengths) -> tuple:
+    """
+    用同一条 token 序列的前 K 个 token 解码，返回 K 和对应重建轨迹。
+    这里复用 model.decode_from_codes，K 可以小于完整 RVQ 层数。
+    """
+    code_values = np.asarray(codes, dtype=np.int64).reshape(-1)
+    max_len = int(code_values.shape[0])
+    clean_lengths = []
+    for value in prefix_lengths:
+        k = int(value)
+        if 1 <= k <= max_len and k not in clean_lengths:
+            clean_lengths.append(k)
+    if not clean_lengths:
+        return np.asarray([], dtype=np.int64), np.zeros((0, 0, 3), dtype=np.float32)
+
+    recons = []
+    model.eval()
+    with torch.no_grad():
+        for k in clean_lengths:
+            token_tensor = torch.as_tensor(code_values[:k][None, :], dtype=torch.long, device=norm_params["mean"].device)
+            recon_norm = model.decode_from_codes(token_tensor)
+            recon = denormalize_trajs_torch(
+                recon_norm,
+                mean=norm_params["mean"],
+                std=norm_params["std"],
+                scale_factor=norm_params["scale_factor"],
+            )
+            recons.append(recon[0].detach().cpu().numpy().astype(np.float32))
+    return np.asarray(clean_lengths, dtype=np.int64), np.stack(recons, axis=0)
+
+
+def plot_target_token_prefix_reconstructions(
+    sample_idx: int,
+    gt_traj: np.ndarray,
+    full_recon_traj: np.ndarray,
+    prefix_lengths: np.ndarray,
+    prefix_recon_trajs: np.ndarray,
+    dt: float,
+    save_path: str,
+    tokens=None,
+    metrics: dict = None,
+) -> None:
+    """
+    画 target case 的 GT、完整重建，以及只用前 1/3/5/... 个 token 的重建。
+    输出面板与 worst-case 单图保持一致：traj、vx、vy、v、curvature、ax、ay、a。
+    """
+    if plt is None:
+        raise RuntimeError("matplotlib is required for plotting.")
+
+    gt_traj = np.asarray(gt_traj, dtype=np.float32)
+    full_recon_traj = np.asarray(full_recon_traj, dtype=np.float32)
+    prefix_recon_trajs = np.asarray(prefix_recon_trajs, dtype=np.float32)
+    prefix_lengths = np.asarray(prefix_lengths, dtype=np.int64).reshape(-1)
+
+    gt_prof = compute_kinematic_profiles(gt_traj[None, ...], dt=dt)
+    full_prof = compute_kinematic_profiles(full_recon_traj[None, ...], dt=dt)
+    prefix_prof = compute_kinematic_profiles(prefix_recon_trajs, dt=dt) if prefix_recon_trajs.size else None
+    t = np.arange(gt_traj.shape[0]) * dt
+
+    fig, axes = plt.subplots(2, 4, figsize=(24, 10))
+    ax_traj, ax_vx, ax_vy, ax_v = axes[0]
+    ax_curv, ax_ax, ax_ay, ax_a = axes[1]
+    axes_specs = [
+        (ax_vx, "vx", "vx", "Velocity (m/s)"),
+        (ax_vy, "vy", "vy", "Velocity (m/s)"),
+        (ax_v, "speed", "v", "Speed (m/s)"),
+        (ax_curv, "curvature", "Signed Curvature", "Curvature (1/m)"),
+        (ax_ax, "ax", "ax", "Acceleration (m/s^2)"),
+        (ax_ay, "ay", "ay", "Acceleration (m/s^2)"),
+        (ax_a, "acc", "a", "Acceleration (m/s^2)"),
+    ]
+
+    gt_xy = gt_prof["xy"][0]
+    full_xy = full_prof["xy"][0]
+    ax_traj.plot(gt_xy[:, 0], gt_xy[:, 1], label="GT", linewidth=2.4, color="black")
+    ax_traj.plot(full_xy[:, 0], full_xy[:, 1], label="Full recon", linewidth=2.2, linestyle="--")
+
+    cmap = plt.get_cmap("tab10")
+    for i, k in enumerate(prefix_lengths.tolist()):
+        prof_xy = prefix_prof["xy"][i]
+        color = cmap(i % 10)
+        ax_traj.plot(prof_xy[:, 0], prof_xy[:, 1], label=f"first {int(k)} tokens", linewidth=1.8, alpha=0.9, color=color)
+
+    ax_traj.scatter(gt_xy[0, 0], gt_xy[0, 1], c="green", s=40, label="Start")
+    ax_traj.scatter(gt_xy[-1, 0], gt_xy[-1, 1], c="red", s=40, label="GT End")
+    ax_traj.scatter(full_xy[-1, 0], full_xy[-1, 1], c="orange", s=40, label="Full Recon End")
+    ax_traj.set_title("Trajectory")
+    ax_traj.set_xlabel("X (m)")
+    ax_traj.set_ylabel("Y (m)")
+    ax_traj.grid(True, alpha=0.3)
+    ax_traj.axis("equal")
+    ax_traj.legend(fontsize=7)
+
+    for ax, key, label, ylabel in axes_specs:
+        ax.plot(t, gt_prof[key][0], label=f"GT {label}", linewidth=2.2, color="black")
+        ax.plot(t, full_prof[key][0], label=f"Full recon {label}", linewidth=2.0, linestyle="--")
+        for i, k in enumerate(prefix_lengths.tolist()):
+            color = cmap(i % 10)
+            ax.plot(t, prefix_prof[key][i], label=f"first {int(k)}", linewidth=1.5, alpha=0.85, color=color)
+        ax.axhline(0.0, color="gray", linewidth=1.0, alpha=0.6)
+        ax.set_title(label)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=7)
+
+    token_text = ""
+    if tokens is not None:
+        token_values = np.asarray(tokens).reshape(-1).tolist()
+        token_text = " | tokens=[" + ",".join(str(int(v)) for v in token_values) + "]"
+    metric_text = ""
+    if metrics:
+        shown = []
+        for key in ["recon_mse", "ade", "fde"]:
+            if key in metrics:
+                shown.append(f"{key}={float(metrics[key]):.4g}")
+        if shown:
+            metric_text = " | " + ", ".join(shown)
+
+    fig.suptitle(f"Target sample_idx={int(sample_idx)} token-prefix recon{metric_text}{token_text}", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    fig.savefig(save_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
 
 def compute_motion_features(all_dxdydyaw_clips: np.ndarray, fps: float = 5.0, time_duration=None):

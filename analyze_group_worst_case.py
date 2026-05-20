@@ -24,8 +24,10 @@ from grouping_pipeline import try_load_grouping_from_cache  # noqa: E402
 from utils import (  # noqa: E402
     compute_kinematic_profiles,
     compute_reconstruction_case_metrics,
+    decode_token_prefix_reconstructions,
     denormalize_trajs_torch,
     load_norm_params_torch,
+    plot_target_token_prefix_reconstructions,
     load_traj_array,
     normalize_trajs_torch,
     token_sequence_to_str,
@@ -177,6 +179,32 @@ def find_sample_group(grouping: Dict[str, object], sample_idx: int) -> Tuple[int
             f"group_id={group_id}, but that group does not contain the sample."
         )
     return group_id, members
+
+
+def unique_source_group_indices(
+    group_indices: np.ndarray,
+    source_indices: Optional[np.ndarray],
+    target_sample_idx: int,
+) -> np.ndarray:
+    """按 source_sample_idx 去重；目标样本对应的 row 始终排第一。"""
+    group_indices = np.asarray(group_indices, dtype=np.int64)
+    if source_indices is None:
+        return group_indices
+
+    ordered: List[int] = []
+    seen_sources = set()
+
+    def add_once(idx: int) -> None:
+        src = int(source_indices[int(idx)])
+        if src in seen_sources:
+            return
+        seen_sources.add(src)
+        ordered.append(int(idx))
+
+    add_once(int(target_sample_idx))
+    for idx in group_indices.tolist():
+        add_once(int(idx))
+    return np.asarray(ordered, dtype=np.int64)
 
 
 def rank_desc(values: np.ndarray, target_pos: int) -> int:
@@ -359,14 +387,15 @@ def choose_visualization_indices(group_indices: np.ndarray, sample_idx: int, max
     return np.asarray(ordered[:max_group_vis], dtype=np.int64)
 
 
-def decode_group_mode_first_token(model, codes: np.ndarray, norm_params: Dict[str, torch.Tensor]) -> Tuple[np.ndarray, int, int]:
-    """构造人工 token：只取 group 内第一层 token 的众数，并只用这一层 token decode。"""
+def decode_group_unique_first_tokens(model, codes: np.ndarray, norm_params: Dict[str, torch.Tensor]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """构造人工 token：group 内所有 unique 第一层 token，各自只用这一层 token decode。"""
     first_tokens = np.asarray(codes)[:, 0].astype(np.int64)
     values, counts = np.unique(first_tokens, return_counts=True)
-    mode_token = int(values[int(np.argmax(counts))])
-    mode_count = int(np.max(counts))
+    order = np.lexsort((values, -counts))  # count 高的排前，便于 overview 对比。
+    values = values[order].astype(np.int64)
+    counts = counts[order].astype(np.int64)
 
-    token_tensor = torch.tensor([[mode_token]], dtype=torch.long, device=norm_params["mean"].device)
+    token_tensor = torch.tensor(values[:, None], dtype=torch.long, device=norm_params["mean"].device)
     model.eval()
     with torch.no_grad():
         recon_norm = model.decode_from_codes(token_tensor)
@@ -376,34 +405,42 @@ def decode_group_mode_first_token(model, codes: np.ndarray, norm_params: Dict[st
             std=norm_params["std"],
             scale_factor=norm_params["scale_factor"],
         )
-    return recon[0].detach().cpu().numpy().astype(np.float32), mode_token, mode_count
+    return recon.detach().cpu().numpy().astype(np.float32), values, counts
 
 
 def plot_recon_only_case(
     sample_idx: int,
-    pred_traj: np.ndarray,
+    pred_trajs: np.ndarray,
     dt: float,
     save_path: str,
     title: str,
+    labels: Optional[List[str]] = None,
 ) -> None:
-    """只画人工 token decode 出来的重建及运动学曲线，不画 GT。"""
-    pred_prof = compute_kinematic_profiles(pred_traj[None, ...], dt=dt)
-    pred_xy = pred_prof["xy"][0]
-    t = np.arange(pred_traj.shape[0]) * dt
+    """只画人工 token decode 出来的重建及运动学曲线，不画 GT；支持多条曲线叠加。"""
+    pred_trajs = np.asarray(pred_trajs, dtype=np.float32)
+    if pred_trajs.ndim == 2:
+        pred_trajs = pred_trajs[None, ...]
+    pred_prof = compute_kinematic_profiles(pred_trajs, dt=dt)
+    pred_xy = pred_prof["xy"]
+    t = np.arange(pred_trajs.shape[1]) * dt
+    labels = labels or [f"Recon {i}" for i in range(pred_trajs.shape[0])]
 
     fig, axes = plt.subplots(2, 4, figsize=(24, 10))
     ax_traj, ax_vx, ax_vy, ax_v = axes[0]
     ax_curv, ax_ax, ax_ay, ax_a = axes[1]
+    cmap = plt.get_cmap("tab20")
 
-    ax_traj.plot(pred_xy[:, 0], pred_xy[:, 1], label="Artificial token recon", linewidth=2.4, linestyle="--")
-    ax_traj.scatter(pred_xy[0, 0], pred_xy[0, 1], c="green", s=40, label="Start")
-    ax_traj.scatter(pred_xy[-1, 0], pred_xy[-1, 1], c="orange", s=40, label="Recon End")
+    for i in range(pred_trajs.shape[0]):
+        color = cmap(i % 20)
+        ax_traj.plot(pred_xy[i, :, 0], pred_xy[i, :, 1], label=labels[i], linewidth=2.0, linestyle="--", color=color)
+        ax_traj.scatter(pred_xy[i, 0, 0], pred_xy[i, 0, 1], c=[color], s=24)
+        ax_traj.scatter(pred_xy[i, -1, 0], pred_xy[i, -1, 1], c=[color], s=24, marker="x")
     ax_traj.set_title("Trajectory")
     ax_traj.set_xlabel("X (m)")
     ax_traj.set_ylabel("Y (m)")
     ax_traj.grid(True, alpha=0.3)
     ax_traj.axis("equal")
-    ax_traj.legend(fontsize=8)
+    ax_traj.legend(fontsize=7)
 
     for ax, key, label, ylabel in [
         (ax_vx, "vx", "vx", "Velocity (m/s)"),
@@ -414,13 +451,15 @@ def plot_recon_only_case(
         (ax_ay, "ay", "ay", "Acceleration (m/s^2)"),
         (ax_a, "acc", "a", "Acceleration (m/s^2)"),
     ]:
-        ax.plot(t, pred_prof[key][0], label=f"Recon {label}", linewidth=2.0, linestyle="--")
+        for i in range(pred_trajs.shape[0]):
+            color = cmap(i % 20)
+            ax.plot(t, pred_prof[key][i], label=labels[i], linewidth=1.8, linestyle="--", color=color)
         ax.axhline(0.0, color="gray", linewidth=1.0, alpha=0.6)
         ax.set_title(label)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=7)
 
     fig.suptitle(f"{title} | sample_idx={sample_idx}")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
@@ -437,9 +476,9 @@ def plot_group_overview(
     dt: float,
     save_path: str,
     total_group_size: int,
-    artificial_pred_traj: Optional[np.ndarray] = None,
-    artificial_token: Optional[int] = None,
-    artificial_count: Optional[int] = None,
+    artificial_pred_trajs: Optional[np.ndarray] = None,
+    artificial_tokens: Optional[np.ndarray] = None,
+    artificial_counts: Optional[np.ndarray] = None,
 ) -> None:
     if sample_indices.size == 0:
         return
@@ -449,8 +488,13 @@ def plot_group_overview(
     gt_xy = gt_prof["xy"]
     pred_xy = pred_prof["xy"]
 
+    artificial_pred_trajs = None if artificial_pred_trajs is None else np.asarray(artificial_pred_trajs, dtype=np.float32)
+    artificial_count_n = 0 if artificial_pred_trajs is None else int(artificial_pred_trajs.shape[0])
+    artificial_tokens = np.asarray(artificial_tokens if artificial_tokens is not None else [], dtype=np.int64)
+    artificial_counts = np.asarray(artificial_counts if artificial_counts is not None else [], dtype=np.int64)
+
     n = int(sample_indices.size)
-    total_panels = n + (1 if artificial_pred_traj is not None else 0)
+    total_panels = n + artificial_count_n
     cols = min(4, total_panels)
     rows = int(math.ceil(total_panels / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(4.4 * cols, 3.8 * rows), squeeze=False)
@@ -460,14 +504,15 @@ def plot_group_overview(
         if i >= total_panels:
             ax.axis("off")
             continue
-        if i == n and artificial_pred_traj is not None:
-            artificial_xy = compute_kinematic_profiles(artificial_pred_traj[None, ...], dt=dt)["xy"][0]
+        if i >= n:
+            j = i - n
+            artificial_xy = compute_kinematic_profiles(artificial_pred_trajs[j:j + 1], dt=dt)["xy"][0]
             ax.plot(artificial_xy[:, 0], artificial_xy[:, 1], linewidth=2.4, linestyle="--", label="Artificial recon")
             ax.scatter(artificial_xy[0, 0], artificial_xy[0, 1], c="green", s=18)
             ax.scatter(artificial_xy[-1, 0], artificial_xy[-1, 1], c="orange", s=18)
             ax.set_title(
-                f"mode first token={artificial_token}\n"
-                f"count={artificial_count}/{total_group_size}, only layer-1 used",
+                f"first token={int(artificial_tokens[j])}\n"
+                f"count={int(artificial_counts[j])}/{total_group_size}, only layer-1 used",
                 fontsize=9,
             )
             ax.grid(True, alpha=0.3)
@@ -490,10 +535,14 @@ def plot_group_overview(
         if i == 0:
             ax.legend(fontsize=8)
 
-    fig.suptitle(f"group_id={group_id} overview | shown={n}/{total_group_size}")
+    fig.suptitle(
+        f"group_id={group_id} overview | shown={n}/{total_group_size} | "
+        f"unique first tokens={artificial_count_n}"
+    )
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(save_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
+
 
 
 def main() -> None:
@@ -511,14 +560,15 @@ def main() -> None:
     target_sample_idx = requested_sample_idx
     source_indices = None
     source_match_indices = np.asarray([], dtype=np.int64)
-    if bool(args.sample_idx_is_source):
-        if not str(args.source_indices_path).strip():
-            raise ValueError("--sample_idx_is_source requires --source_indices_path.")
+    if bool(args.sample_idx_is_source) and not str(args.source_indices_path).strip():
+        raise ValueError("--sample_idx_is_source requires --source_indices_path.")
+    if str(args.source_indices_path).strip():
         source_indices = np.load(args.source_indices_path).astype(np.int64).reshape(-1)
         if source_indices.shape[0] != n_total:
             raise ValueError(
                 f"source_indices length mismatch: {source_indices.shape[0]} vs data N={n_total}"
             )
+    if bool(args.sample_idx_is_source):
         source_match_indices = np.where(source_indices == requested_sample_idx)[0].astype(np.int64)
         if source_match_indices.size == 0:
             raise ValueError(
@@ -539,6 +589,12 @@ def main() -> None:
         n_total=n_total,
     )
     group_id, group_indices = find_sample_group(grouping, sample_idx=target_sample_idx)
+    raw_group_indices = np.asarray(group_indices, dtype=np.int64)
+    group_indices = unique_source_group_indices(
+        group_indices=group_indices,
+        source_indices=source_indices,
+        target_sample_idx=target_sample_idx,
+    )
 
     print(f"Loaded grouping cache: {cache_dir}")
     if bool(args.sample_idx_is_source):
@@ -552,7 +608,11 @@ def main() -> None:
     else:
         print(f"target sample_idx: {target_sample_idx}")
     print(f"group_id: {group_id}")
-    print(f"group size: {int(group_indices.size)}")
+    if source_indices is not None and raw_group_indices.size != group_indices.size:
+        print(f"raw group size: {int(raw_group_indices.size)}")
+        print(f"unique-source group size: {int(group_indices.size)}")
+    else:
+        print(f"group size: {int(group_indices.size)}")
     print("group sample_idx list:")
     print(",".join(str(int(v)) for v in group_indices.tolist()))
 
@@ -578,14 +638,17 @@ def main() -> None:
         clip_limit=norm_params["clip_limit"],
         batch_size=int(args.batch_size),
     )
-    artificial_traj, artificial_token, artificial_count = decode_group_mode_first_token(
+    artificial_trajs, artificial_tokens, artificial_counts = decode_group_unique_first_tokens(
         model=model,
         codes=codes,
         norm_params=norm_params,
     )
+    token_summary = ", ".join(
+        f"{int(tok)}:{int(cnt)}" for tok, cnt in zip(artificial_tokens.tolist(), artificial_counts.tolist())
+    )
     print(
-        f"Artificial token recon: first_token_mode={artificial_token} "
-        f"({artificial_count}/{int(group_indices.size)}), decode with only this token."
+        f"Artificial first-token recon: unique_count={int(artificial_tokens.size)} | "
+        f"token:count = {token_summary}"
     )
 
     metrics = compute_reconstruction_case_metrics(group_trajs, recon_trajs, dt=float(args.dt))
@@ -659,6 +722,29 @@ def main() -> None:
     }
     target_metrics = metric_at(metrics, target_pos)
 
+    prefix_lengths = np.arange(1, int(codes.shape[1]) + 1, 2, dtype=np.int64)
+    prefix_lengths, prefix_recon_trajs = decode_token_prefix_reconstructions(
+        model=model,
+        codes=codes[target_pos],
+        norm_params=norm_params,
+        prefix_lengths=prefix_lengths,
+    )
+    target_prefix_path = os.path.join(
+        args.out_dir,
+        f"target_sample_{int(target_sample_idx)}_token_prefix_recon.png",
+    )
+    plot_target_token_prefix_reconstructions(
+        sample_idx=int(target_sample_idx),
+        gt_traj=group_trajs[target_pos],
+        full_recon_traj=recon_trajs[target_pos],
+        prefix_lengths=prefix_lengths,
+        prefix_recon_trajs=prefix_recon_trajs,
+        dt=float(args.dt),
+        save_path=target_prefix_path,
+        tokens=codes[target_pos],
+        metrics=target_metrics,
+    )
+
     print("\nTarget case loss:")
     print(
         f"  recon_mse={target_metrics['recon_mse']:.6f}, "
@@ -711,12 +797,17 @@ def main() -> None:
         args.out_dir,
         f"group_{group_id}_sample_artificial_token.png",
     )
+    artificial_labels = [
+        f"first token={int(tok)} ({int(cnt)}/{int(group_indices.size)})"
+        for tok, cnt in zip(artificial_tokens.tolist(), artificial_counts.tolist())
+    ]
     plot_recon_only_case(
         sample_idx=int(target_sample_idx),
-        pred_traj=artificial_traj,
+        pred_trajs=artificial_trajs,
         dt=float(args.dt),
         save_path=artificial_sample_path,
-        title=f"Group {group_id} artificial first-token recon [{artificial_token}]",
+        title=f"Group {group_id} artificial first-token recons",
+        labels=artificial_labels,
     )
 
     if vis_indices.size > 0:
@@ -732,9 +823,9 @@ def main() -> None:
             dt=float(args.dt),
             save_path=overview_path,
             total_group_size=int(group_indices.size),
-            artificial_pred_traj=artificial_traj,
-            artificial_token=artificial_token,
-            artificial_count=artificial_count,
+            artificial_pred_trajs=artificial_trajs,
+            artificial_tokens=artificial_tokens,
+            artificial_counts=artificial_counts,
         )
 
     summary = {
@@ -746,6 +837,9 @@ def main() -> None:
         "group_id": int(group_id),
         "group_size": int(group_indices.size),
         "group_sample_indices": [int(v) for v in group_indices.tolist()],
+        "unique_source_group": bool(source_indices is not None),
+        "raw_group_size": int(raw_group_indices.size),
+        "raw_group_sample_indices": [int(v) for v in raw_group_indices.tolist()],
         "group_cache_dir": cache_dir,
         "model_path": os.path.abspath(args.model_path),
         "num_layers_arg": int(args.num_layers),
@@ -758,9 +852,13 @@ def main() -> None:
         "group_loss_stats": stats,
         "target_rank_desc": ranks,
         "visualized_sample_indices": [int(v) for v in vis_indices.tolist()],
-        "artificial_first_token": int(artificial_token),
-        "artificial_first_token_count": int(artificial_count),
+        "artificial_first_tokens": [int(v) for v in artificial_tokens.tolist()],
+        "artificial_first_token_counts": [int(v) for v in artificial_counts.tolist()],
+        "artificial_first_token": int(artificial_tokens[0]) if artificial_tokens.size else None,
+        "artificial_first_token_count": int(artificial_counts[0]) if artificial_counts.size else None,
         "artificial_token_plot_path": os.path.abspath(artificial_sample_path),
+        "target_token_prefix_plot_path": os.path.abspath(target_prefix_path),
+        "target_token_prefix_lengths": [int(v) for v in prefix_lengths.tolist()],
     }
     summary_path = os.path.join(args.out_dir, "group_case_analysis_summary.json")
     write_json(summary_path, summary)

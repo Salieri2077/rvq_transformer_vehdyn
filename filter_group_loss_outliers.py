@@ -45,11 +45,16 @@ def parse_args():
     parser.add_argument("--loss_epoch", "--loss-epoch", type=int, default=31)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
 
-    # 简单组内 outlier 规则：同时满足倍数阈值和 IQR 阈值才剔除。
+    # 大组沿用 median + IQR；小组用 max/min ratio + 全局分位阈值，避免小组被直接跳过。
     parser.add_argument("--min_group_size", "--min-group-size", type=int, default=3)
+    parser.add_argument("--large_group_min_size", "--large-group-min-size", type=int, default=4)
     parser.add_argument("--ratio_threshold", "--ratio-threshold", type=float, default=10.0)
     parser.add_argument("--iqr_mult", "--iqr-mult", type=float, default=3.0)
     parser.add_argument("--hard_iqr_mult", "--hard-iqr-mult", type=float, default=1.0)
+    parser.add_argument("--small_group_hard_ratio", "--small-group-hard-ratio", type=float, default=5.0)
+    parser.add_argument("--small_group_remove_ratio", "--small-group-remove-ratio", type=float, default=12.0)
+    parser.add_argument("--global_hard_percentile", "--global-hard-percentile", type=float, default=80.0)
+    parser.add_argument("--global_remove_percentile", "--global-remove-percentile", type=float, default=99.5)
     parser.add_argument("--duplicate_hard_count", "--duplicate-hard-count", type=int, default=5)
     parser.add_argument("--inspect_sample_idx", "--inspect-sample-idx", type=int, default=-1)
     return parser.parse_args()
@@ -87,6 +92,18 @@ def save_by_indices(data, indices, out_path, n_total):
         np.save(out_path, np.asarray(data)[indices])
 
 
+def normalize_csv_rows(rows):
+    """small/large group 行字段不同；写 CSV 前补齐字段并集，保持输出稳定。"""
+    if not rows:
+        return rows
+    fieldnames = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+    return [{key: row.get(key, "") for key in fieldnames} for row in rows]
+
+
 def compute_ade_fde(model, trajs, norm_params, batch_size):
     """按 batch 计算 ADE/FDE，避免一次性保存全量 reconstruction。"""
     ades = []
@@ -121,15 +138,138 @@ def _iqr_hard_threshold(values, members, hard_iqr_mult):
     return float(q75) + float(hard_iqr_mult) * max(iqr, 1e-8)
 
 
-def find_group_outliers(weights, ades, fdes, group_to_indices, min_group_size, ratio_threshold, iqr_mult, hard_iqr_mult):
+def handle_small_group(
+    group_id,
+    members,
+    weights,
+    ades,
+    fdes,
+    remove_mask,
+    remove_rows,
+    duplicate_indices,
+    duplicate_rows,
+    duplicate_set,
+    small_group_hard_ratio,
+    small_group_remove_ratio,
+    global_thresholds,
+):
+    """
+    小组不能稳定估计 IQR，因此只做相对组内 min 的 ratio 判断，
+    再叠加全局分位阈值，避免复制绝对误差很小的样本。
+    """
+    members = np.asarray(members, dtype=np.int64)
+    if members.size <= 1:
+        return
+
+    min_weight = float(np.min(weights[members]))
+    min_ade = float(np.min(ades[members]))
+    min_fde = float(np.min(fdes[members]))
+
+    for sample_idx in members.tolist():
+        sample_idx = int(sample_idx)
+        weight_ratio = float(weights[sample_idx] / max(min_weight, 1e-8))
+        ade_ratio = float(ades[sample_idx] / max(min_ade, 1e-8))
+        fde_ratio = float(fdes[sample_idx] / max(min_fde, 1e-8))
+
+        base_row = {
+            "group_id": int(group_id),
+            "sample_idx": sample_idx,
+            "weight": float(weights[sample_idx]),
+            "ade": float(ades[sample_idx]),
+            "fde": float(fdes[sample_idx]),
+            "group_size": int(members.size),
+            "min_group_weight": min_weight,
+            "min_group_ade": min_ade,
+            "min_group_fde": min_fde,
+            "weight_ratio_to_min": weight_ratio,
+            "ade_ratio_to_min": ade_ratio,
+            "fde_ratio_to_min": fde_ratio,
+            "global_hard_weight": float(global_thresholds["hard_weight"]),
+            "global_hard_ade": float(global_thresholds["hard_ade"]),
+            "global_hard_fde": float(global_thresholds["hard_fde"]),
+            "global_remove_weight": float(global_thresholds["remove_weight"]),
+        }
+
+        # 小组删除非常保守：只看 weight，避免 ADE/FDE 单项偏高导致误删。
+        should_remove = (
+            weight_ratio >= float(small_group_remove_ratio)
+            and weights[sample_idx] >= float(global_thresholds["remove_weight"])
+        )
+        if should_remove:
+            remove_mask[sample_idx] = True
+            row = dict(base_row)
+            row["remove_reason"] = "small_group_weight_extreme"
+            remove_rows.append(row)
+            continue
+
+        if remove_mask[sample_idx] or sample_idx in duplicate_set:
+            continue
+
+        hard_reasons = []
+        if (
+            weight_ratio >= float(small_group_hard_ratio)
+            and weights[sample_idx] >= float(global_thresholds["hard_weight"])
+        ):
+            hard_reasons.append("small_group_weight")
+        if (
+            ade_ratio >= float(small_group_hard_ratio)
+            and ades[sample_idx] >= float(global_thresholds["hard_ade"])
+        ):
+            hard_reasons.append("small_group_ade")
+        if (
+            fde_ratio >= float(small_group_hard_ratio)
+            and fdes[sample_idx] >= float(global_thresholds["hard_fde"])
+        ):
+            hard_reasons.append("small_group_fde")
+
+        if hard_reasons:
+            duplicate_set.add(sample_idx)
+            duplicate_indices.append(sample_idx)
+            row = dict(base_row)
+            row["hard_reason"] = ",".join(hard_reasons)
+            duplicate_rows.append(row)
+
+
+def find_group_outliers(
+    weights,
+    ades,
+    fdes,
+    group_to_indices,
+    large_group_min_size,
+    ratio_threshold,
+    iqr_mult,
+    hard_iqr_mult,
+    small_group_hard_ratio,
+    small_group_remove_ratio,
+    global_thresholds,
+):
     remove_mask = np.zeros(weights.shape[0], dtype=bool)
     remove_rows = []
     duplicate_indices = []
     duplicate_rows = []
+    duplicate_set = set()
 
     for group_id, members in enumerate(group_to_indices):
         members = np.asarray(members, dtype=np.int64)
-        if members.size < min_group_size:
+        if members.size <= 1:
+            continue
+
+        if members.size < int(large_group_min_size):
+            handle_small_group(
+                group_id=group_id,
+                members=members,
+                weights=weights,
+                ades=ades,
+                fdes=fdes,
+                remove_mask=remove_mask,
+                remove_rows=remove_rows,
+                duplicate_indices=duplicate_indices,
+                duplicate_rows=duplicate_rows,
+                duplicate_set=duplicate_set,
+                small_group_hard_ratio=small_group_hard_ratio,
+                small_group_remove_ratio=small_group_remove_ratio,
+                global_thresholds=global_thresholds,
+            )
             continue
 
         group_w = weights[members]
@@ -137,8 +277,7 @@ def find_group_outliers(weights, ades, fdes, group_to_indices, min_group_size, r
         q25, q75 = np.percentile(group_w, [25, 75])
         iqr = float(q75 - q25)
 
-        # 同时看“相对 median 的倍数”和“相对组内分布的 IQR outlier”。
-        # 这样 1078274 这种 weight 比同组大几十倍的样本会被剔除。
+        # 大组保留原来的策略：同时看“相对 median 的倍数”和 IQR outlier。
         ratio_threshold_value = max(median, 1e-8) * float(ratio_threshold)
         iqr_threshold_value = float(q75) + float(iqr_mult) * max(iqr, 1e-8)
         remove_threshold = max(ratio_threshold_value, iqr_threshold_value)
@@ -159,11 +298,11 @@ def find_group_outliers(weights, ades, fdes, group_to_indices, min_group_size, r
                     "group_iqr_weight": iqr,
                     "remove_threshold": float(remove_threshold),
                     "ratio_to_median": float(weights[sample_idx] / max(median, 1e-8)),
+                    "remove_reason": "large_group_weight_extreme",
                 }
             )
 
         # hard 样本：不是极端坏点，但 weight/ADE/FDE 任一指标在组内偏高。
-        # 这能覆盖 971299 这种 global ADE/FDE 很差、但 weight 没到删除阈值的样本。
         weight_hard_threshold = _iqr_hard_threshold(weights, members, hard_iqr_mult)
         ade_hard_threshold = _iqr_hard_threshold(ades, members, hard_iqr_mult)
         fde_hard_threshold = _iqr_hard_threshold(fdes, members, hard_iqr_mult)
@@ -178,6 +317,9 @@ def find_group_outliers(weights, ades, fdes, group_to_indices, min_group_size, r
         hard_local = np.where(hard_mask)[0]
         for local_pos in hard_local.tolist():
             sample_idx = int(members[local_pos])
+            if remove_mask[sample_idx] or sample_idx in duplicate_set:
+                continue
+            duplicate_set.add(sample_idx)
             duplicate_indices.append(sample_idx)
             duplicate_rows.append(
                 {
@@ -210,7 +352,6 @@ def find_group_outliers(weights, ades, fdes, group_to_indices, min_group_size, r
             )
 
     return remove_mask, remove_rows, np.asarray(duplicate_indices, dtype=np.int64), duplicate_rows
-
 
 def main():
     args = parse_args()
@@ -264,15 +405,27 @@ def main():
         batch_size=int(args.batch_size),
     )
 
+    # 小组 ratio 判断需要绝对误差门槛，避免复制“只是相对差、但绝对误差很小”的样本。
+    global_thresholds = {
+        "hard_weight": float(np.percentile(weights, float(args.global_hard_percentile))),
+        "hard_ade": float(np.percentile(ades, float(args.global_hard_percentile))),
+        "hard_fde": float(np.percentile(fdes, float(args.global_hard_percentile))),
+        "remove_weight": float(np.percentile(weights, float(args.global_remove_percentile))),
+    }
+    large_group_min_size = max(int(args.large_group_min_size), int(args.min_group_size))
+
     remove_mask, removed_rows, duplicate_indices, duplicate_rows = find_group_outliers(
         weights=weights,
         ades=ades,
         fdes=fdes,
         group_to_indices=grouping["group_to_indices"],
-        min_group_size=int(args.min_group_size),
+        large_group_min_size=large_group_min_size,
         ratio_threshold=float(args.ratio_threshold),
         iqr_mult=float(args.iqr_mult),
         hard_iqr_mult=float(args.hard_iqr_mult),
+        small_group_hard_ratio=float(args.small_group_hard_ratio),
+        small_group_remove_ratio=float(args.small_group_remove_ratio),
+        global_thresholds=global_thresholds,
     )
     keep_mask = ~remove_mask
 
@@ -297,8 +450,8 @@ def main():
 
     removed_csv = os.path.join(out_dir, "removed_group_loss_outliers.csv")
     duplicated_csv = os.path.join(out_dir, "duplicated_hard_group_loss_samples.csv")
-    write_csv(removed_rows, removed_csv)
-    write_csv(duplicate_rows, duplicated_csv)
+    write_csv(normalize_csv_rows(removed_rows), removed_csv)
+    write_csv(normalize_csv_rows(duplicate_rows), duplicated_csv)
 
     inspected = None
     if int(args.inspect_sample_idx) >= 0:
@@ -330,6 +483,12 @@ def main():
         "source_indices_path": os.path.abspath(source_indices_path),
         "removed_ratio": float(removed_indices.size / max(n_total, 1)),
         "min_group_size": int(args.min_group_size),
+        "large_group_min_size": int(large_group_min_size),
+        "small_group_hard_ratio": float(args.small_group_hard_ratio),
+        "small_group_remove_ratio": float(args.small_group_remove_ratio),
+        "global_hard_percentile": float(args.global_hard_percentile),
+        "global_remove_percentile": float(args.global_remove_percentile),
+        "global_thresholds": global_thresholds,
         "ratio_threshold": float(args.ratio_threshold),
         "iqr_mult": float(args.iqr_mult),
         "hard_iqr_mult": float(args.hard_iqr_mult),
