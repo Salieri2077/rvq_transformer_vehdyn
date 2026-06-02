@@ -11,6 +11,7 @@ import torch
 
 from train_tfm import TrajRVQTransformer
 from train_tfm_accint import AccFirstRVQTokenizer
+from train_tfm_bicycle import TrajRVQBicycleTransformer
 from utils import (
     build_scenario_masks,
     compute_kinematic_profiles,
@@ -257,7 +258,7 @@ def select_velocity_acc_variation_indices(
         out[scenario_name] = selected_items
     return out
 
-ModelUnion = Union[TrajRVQTransformer, AccFirstRVQTokenizer]
+ModelUnion = Union[TrajRVQTransformer, AccFirstRVQTokenizer, TrajRVQBicycleTransformer]
 
 
 def reconstruct_trajs(
@@ -268,6 +269,7 @@ def reconstruct_trajs(
     scale_factor: torch.Tensor,
     clip_limit: torch.Tensor,
     batch_size: int,
+    dt: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     all_recons: List[np.ndarray] = []
     all_codes: List[np.ndarray] = []
@@ -278,7 +280,14 @@ def reconstruct_trajs(
             x_norm = normalize_trajs(batch, mean, std, scale_factor, clip_limit)
             z = model.encode(x_norm)
             _, _, codes = model.rvq(z)
-            x_recon_norm = model.decode_from_codes(codes)
+            if isinstance(model, TrajRVQBicycleTransformer):
+                # Bicycle decoder needs initial signed longitudinal speed.
+                # During training forward this comes from GT dx[0] / dt; pass
+                # the same context here so reconstruction metrics are aligned.
+                v0 = torch.tensor(batch[:, 0, 0] / (dt + 1e-8), dtype=torch.float32, device=mean.device)
+                x_recon_norm = model.decode_from_codes(codes, v0=v0)
+            else:
+                x_recon_norm = model.decode_from_codes(codes)
             x_recon = denormalize_trajs(x_recon_norm, mean, std, scale_factor)
             all_recons.append(x_recon.cpu().numpy())
             all_codes.append(codes.cpu().numpy())
@@ -656,9 +665,23 @@ def infer_model_type(model_path: str, model_type: str) -> str:
     if model_type != "auto":
         return model_type
     basename = os.path.basename(model_path)
+    if "bicycle" in basename:
+        return "bicycle"
     if ("accint" in basename) or ("accfirst" in basename):
         return "accint"
     return "taae"
+
+
+def load_bicycle_config(model_path: str, data_type: str) -> Dict[str, float]:
+    """Load optional bicycle config saved by train_tfm_bicycle.py."""
+    config_path = os.path.join(
+        os.path.dirname(model_path),
+        f"{data_type}_rvq_bicycle_config.json",
+    )
+    if not os.path.exists(config_path):
+        return {}
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def build_model(
@@ -668,6 +691,9 @@ def build_model(
     model_type: str,
     num_transformer_layers: int = 2,
     num_layers: int = 15,
+    dt: float = 0.2,
+    acc_max: float = 8.0,
+    yaw_rate_max: float = 1.0,
 ) -> ModelUnion:
     state_dict = torch.load(model_path, map_location=device)
     if int(num_layers) <= 0:
@@ -691,6 +717,19 @@ def build_model(
             nhead=4,
             num_transformer_layers=num_transformer_layers,
             dt=0.2,
+        ).to(device)
+    elif model_type == "bicycle":
+        model = TrajRVQBicycleTransformer(
+            input_steps=input_steps,
+            input_dim=3,
+            num_layers=int(num_layers),
+            vocab_size=1024,
+            d_model=128,
+            nhead=4,
+            num_transformer_layers=num_transformer_layers,
+            dt=dt,
+            acc_max=acc_max,
+            yaw_rate_max=yaw_rate_max,
         ).to(device)
     else:
         model = TrajRVQTransformer(
@@ -729,7 +768,7 @@ def main():
     parser.add_argument("--data-path", type=str, default=resolve_default_data_path())
     parser.add_argument("--save-dir", type=str, default="./work_dirs/tokenizer/rvq_tfm_kin_0311")
     parser.add_argument("--model-path", type=str, default=None)
-    parser.add_argument("--model-type", type=str, default="auto", choices=["auto", "taae", "accint"])
+    parser.add_argument("--model-type", type=str, default="auto", choices=["auto", "taae", "accint", "bicycle"])
     parser.add_argument("--data-type", type=str, default="pred", choices=["pred", "history"])
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--fps", type=float, default=5.0)
@@ -742,21 +781,39 @@ def main():
     parser.add_argument("--num-transformer-layers", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=15)
     parser.add_argument("--plot-acc-max", type=float, default=8.0)
+    parser.add_argument("--acc-max", type=float, default=8.0)
+    parser.add_argument("--yaw-rate-max", type=float, default=1.0)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.model_path is not None:
         model_path = args.model_path
+    elif args.model_type == "bicycle":
+        model_path = os.path.join(args.save_dir, f"{args.data_type}_rvq_bicycle_model.pth")
     elif args.model_type == "accint":
         model_path = os.path.join(args.save_dir, f"{args.data_type}_rvq_accint_model.pth")
     elif args.model_type == "taae":
         model_path = os.path.join(args.save_dir, f"{args.data_type}_rvq_taae_model.pth")
     else:
+        bicycle_path = os.path.join(args.save_dir, f"{args.data_type}_rvq_bicycle_model.pth")
         accint_path = os.path.join(args.save_dir, f"{args.data_type}_rvq_accint_model.pth")
         taae_path = os.path.join(args.save_dir, f"{args.data_type}_rvq_taae_model.pth")
-        model_path = accint_path if os.path.exists(accint_path) else taae_path
+        if os.path.exists(bicycle_path):
+            model_path = bicycle_path
+        elif os.path.exists(accint_path):
+            model_path = accint_path
+        else:
+            model_path = taae_path
 
     resolved_model_type = infer_model_type(model_path, args.model_type)
+    bicycle_config = load_bicycle_config(model_path, args.data_type) if resolved_model_type == "bicycle" else {}
+    eval_dt = float(bicycle_config.get("dt", args.dt))
+    eval_num_layers = int(bicycle_config.get("num_layers", args.num_layers))
+    eval_num_transformer_layers = int(
+        bicycle_config.get("num_transformer_layers", args.num_transformer_layers)
+    )
+    eval_acc_max = float(bicycle_config.get("acc_max", args.acc_max))
+    eval_yaw_rate_max = float(bicycle_config.get("yaw_rate_max", args.yaw_rate_max))
     norm_path = os.path.join(args.save_dir, f"{args.data_type}_norm_params.pkl")
     output_dir = args.output_dir or os.path.join(args.save_dir, "scenario_eval")
     os.makedirs(output_dir, exist_ok=True)
@@ -770,8 +827,11 @@ def main():
         input_steps=trajs.shape[1],
         device=device,
         model_type=resolved_model_type,
-        num_transformer_layers=args.num_transformer_layers,
-        num_layers=args.num_layers,
+        num_transformer_layers=eval_num_transformer_layers,
+        num_layers=eval_num_layers,
+        dt=eval_dt,
+        acc_max=eval_acc_max,
+        yaw_rate_max=eval_yaw_rate_max,
     )
     norm_params = load_norm_params(norm_path, device)
     model.set_norm_params(norm_params["mean"], norm_params["std"], norm_params["scale_factor"])
@@ -784,6 +844,7 @@ def main():
         scale_factor=norm_params["scale_factor"],
         clip_limit=norm_params["clip_limit"],
         batch_size=args.batch_size,
+        dt=eval_dt,
     )
 
     categories, feat = build_scenario_masks(trajs, fps=args.fps)
@@ -791,7 +852,7 @@ def main():
     variation_representatives = select_velocity_acc_variation_indices(
         trajs=trajs,
         categories=categories,
-        dt=args.dt,
+        dt=eval_dt,
         num_samples=args.num_var_plots,
         exclude_indices=representatives,
     )
@@ -801,7 +862,7 @@ def main():
         recon_trajs=recon_trajs,
         categories=categories,
         num_samples=args.num_worst_plots,
-        dt=args.dt,
+        dt=eval_dt,
         exclude_indices=worst_exclude_indices,
     )
     sign_flip_representatives = select_endpoint_sign_flip_indices(
@@ -809,7 +870,7 @@ def main():
         recon_trajs=recon_trajs,
         categories=categories,
         num_samples=args.num_sign_flip_plots,
-        dt=args.dt,
+        dt=eval_dt,
         exclude_indices=worst_exclude_indices,
     )
     unclassified_mask = build_unclassified_mask(categories, len(trajs))
@@ -819,7 +880,7 @@ def main():
         recon_trajs=recon_trajs,
         categories=unclassified_categories,
         num_samples=args.num_unclassified_plots,
-        dt=args.dt,
+        dt=eval_dt,
     )
 
     total_samples = max(int(len(trajs)), 1)
@@ -838,7 +899,7 @@ def main():
             metrics_by_scenario[scenario_name] = {"count": 0}
             continue
 
-        metrics = scenario_metrics(trajs[idxs], recon_trajs[idxs], dt=args.dt)
+        metrics = scenario_metrics(trajs[idxs], recon_trajs[idxs], dt=eval_dt)
         rep_idx = representatives[scenario_name]["idx"]
         rep_info = representatives[scenario_name]["info"]
         metrics.update(
@@ -858,7 +919,7 @@ def main():
             target_count=1 if rep_idx is not None else 0,
             trajs=trajs,
             recon_trajs=recon_trajs,
-            dt=args.dt,
+            dt=eval_dt,
             acc_max=args.plot_acc_max,
             acc_peak_cache=acc_peak_cache,
         )
@@ -869,7 +930,7 @@ def main():
                 sample_idx=classic_idx,
                 gt_traj=trajs[classic_idx],
                 pred_traj=recon_trajs[classic_idx],
-                dt=args.dt,
+                dt=eval_dt,
                 save_path=os.path.join(output_dir, f"{scenario_name}_classic.png"),
                 sample_tokens=codes[classic_idx],
             )
@@ -882,7 +943,7 @@ def main():
             target_count=int(args.num_var_plots),
             trajs=trajs,
             recon_trajs=recon_trajs,
-            dt=args.dt,
+            dt=eval_dt,
             acc_max=args.plot_acc_max,
             acc_peak_cache=acc_peak_cache,
         )
@@ -893,7 +954,7 @@ def main():
                 sample_idx=var_idx,
                 gt_traj=trajs[var_idx],
                 pred_traj=recon_trajs[var_idx],
-                dt=args.dt,
+                dt=eval_dt,
                 save_path=os.path.join(output_dir, f"{scenario_name}_var{plot_id:02d}.png"),
                 sample_tokens=codes[var_idx],
             )
@@ -906,7 +967,7 @@ def main():
             target_count=int(args.num_worst_plots),
             trajs=trajs,
             recon_trajs=recon_trajs,
-            dt=args.dt,
+            dt=eval_dt,
             acc_max=args.plot_acc_max,
             acc_peak_cache=acc_peak_cache,
         )
@@ -917,7 +978,7 @@ def main():
                 sample_idx=worst_idx,
                 gt_traj=trajs[worst_idx],
                 pred_traj=recon_trajs[worst_idx],
-                dt=args.dt,
+                dt=eval_dt,
                 save_path=os.path.join(output_dir, f"{scenario_name}_worst_{plot_id:02d}.png"),
                 sample_tokens=codes[worst_idx],
             )
@@ -930,7 +991,7 @@ def main():
             target_count=int(args.num_sign_flip_plots),
             trajs=trajs,
             recon_trajs=recon_trajs,
-            dt=args.dt,
+            dt=eval_dt,
             acc_max=args.plot_acc_max,
             acc_peak_cache=acc_peak_cache,
         )
@@ -941,7 +1002,7 @@ def main():
                 sample_idx=flip_idx,
                 gt_traj=trajs[flip_idx],
                 pred_traj=recon_trajs[flip_idx],
-                dt=args.dt,
+                dt=eval_dt,
                 save_path=os.path.join(output_dir, f"{scenario_name}_signflip_{plot_id:02d}.png"),
                 sample_tokens=codes[flip_idx],
             )
@@ -949,7 +1010,7 @@ def main():
 
     unclassified_indices = np.where(unclassified_mask)[0]
     if len(unclassified_indices) > 0:
-        unclassified_metrics = scenario_metrics(trajs[unclassified_indices], recon_trajs[unclassified_indices], dt=args.dt)
+        unclassified_metrics = scenario_metrics(trajs[unclassified_indices], recon_trajs[unclassified_indices], dt=eval_dt)
     else:
         unclassified_metrics = {"count": 0}
     primary_unclassified = [int(item["idx"]) for item in unclassified_representatives["Unclassified"]]
@@ -959,7 +1020,7 @@ def main():
         target_count=int(args.num_unclassified_plots),
         trajs=trajs,
         recon_trajs=recon_trajs,
-        dt=args.dt,
+        dt=eval_dt,
         acc_max=args.plot_acc_max,
         acc_peak_cache=acc_peak_cache,
     )
@@ -970,13 +1031,13 @@ def main():
             sample_idx=unclassified_idx,
             gt_traj=trajs[unclassified_idx],
             pred_traj=recon_trajs[unclassified_idx],
-            dt=args.dt,
+            dt=eval_dt,
             save_path=os.path.join(output_dir, f"Unclassified_worst_{plot_id:02d}.png"),
             sample_tokens=codes[unclassified_idx],
         )
         plot_saved_count += 1
 
-    overall_metrics = scenario_metrics(trajs, recon_trajs, dt=args.dt)
+    overall_metrics = scenario_metrics(trajs, recon_trajs, dt=eval_dt)
     summary = {
         "config": {
             "data_path": args.data_path,
@@ -986,13 +1047,16 @@ def main():
             "data_type": args.data_type,
             "batch_size": args.batch_size,
             "fps": args.fps,
-            "dt": args.dt,
+            "dt": eval_dt,
             "output_dir": output_dir,
             "num_var_plots": args.num_var_plots,
             "num_worst_plots": args.num_worst_plots,
             "num_sign_flip_plots": args.num_sign_flip_plots,
             "num_unclassified_plots": args.num_unclassified_plots,
-            "num_transformer_layers": args.num_transformer_layers,
+            "num_layers": eval_num_layers,
+            "num_transformer_layers": eval_num_transformer_layers,
+            "acc_max": eval_acc_max,
+            "yaw_rate_max": eval_yaw_rate_max,
             "plot_acc_max": args.plot_acc_max,
         },
         "overall": overall_metrics,

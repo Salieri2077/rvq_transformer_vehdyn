@@ -467,6 +467,183 @@ def compute_reconstruction_case_metrics(gt_trajs: np.ndarray, pred_trajs: np.nda
     }
 
 
+def compute_reconstruction_case_metrics_batched(
+    model,
+    trajs: np.ndarray,
+    norm_params: dict,
+    batch_size: int,
+    dt: float,
+) -> dict:
+    """Compute per-sample reconstruction metrics without storing all reconstructions at once."""
+    chunks = {key: [] for key in ["recon_mse", "ade", "fde", "max_error"]}
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(trajs), int(batch_size)):
+            batch = np.asarray(trajs[start : start + int(batch_size)], dtype=np.float32)
+            x_norm = normalize_trajs_torch(
+                batch,
+                mean=norm_params["mean"],
+                std=norm_params["std"],
+                scale_factor=norm_params["scale_factor"],
+                clip_limit=norm_params.get("clip_limit"),
+            )
+            forward_out = model(x_norm)
+            x_recon_norm = forward_out[0] if isinstance(forward_out, (tuple, list)) else forward_out
+            x_recon = denormalize_trajs_torch(
+                x_recon_norm,
+                mean=norm_params["mean"],
+                std=norm_params["std"],
+                scale_factor=norm_params["scale_factor"],
+            )
+            batch_metrics = compute_reconstruction_case_metrics(
+                batch,
+                x_recon.detach().cpu().numpy().astype(np.float32),
+                dt=float(dt),
+            )
+            for key, value in batch_metrics.items():
+                chunks[key].append(np.asarray(value, dtype=np.float64))
+    return {key: np.concatenate(value, axis=0).astype(np.float64) for key, value in chunks.items()}
+
+
+def summarize_reconstruction_case_metrics(metrics: dict, vrr_threshold: float = 1.0) -> dict:
+    """Summarize arrays returned by compute_reconstruction_case_metrics_batched."""
+    max_error = np.asarray(metrics["max_error"], dtype=np.float64)
+    out = {"count": int(max_error.shape[0])}
+    for key in ["recon_mse", "ade", "fde", "max_error"]:
+        values = np.asarray(metrics[key], dtype=np.float64)
+        out[f"{key}_mean"] = float(np.mean(values)) if values.size else 0.0
+        out[f"{key}_percentiles"] = percentiles(values)
+    out[f"vrr_{float(vrr_threshold):g}m"] = float(np.mean(max_error < float(vrr_threshold))) if max_error.size else 0.0
+    return out
+
+
+def select_top_metric_indices(
+    metrics: dict,
+    metric_key: str,
+    top_k: int,
+    source_indices: np.ndarray = None,
+    unique_source: bool = True,
+) -> np.ndarray:
+    """Select top-k sample indices by a per-sample metric, optionally deduping by source id."""
+    values = np.asarray(metrics[metric_key], dtype=np.float64).reshape(-1)
+    if int(top_k) <= 0 or values.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+    source = None if source_indices is None else np.asarray(source_indices, dtype=np.int64).reshape(-1)
+    if source is not None and source.shape[0] != values.shape[0]:
+        raise ValueError(f"source_indices length mismatch: {source.shape[0]} vs metric length {values.shape[0]}")
+
+    order = np.argsort(values)[::-1]
+    selected = []
+    seen_sources = set()
+    for idx in order.tolist():
+        idx = int(idx)
+        if bool(unique_source) and source is not None:
+            src = int(source[idx])
+            if src in seen_sources:
+                continue
+            seen_sources.add(src)
+        selected.append(idx)
+        if len(selected) >= int(top_k):
+            break
+    return np.asarray(selected, dtype=np.int64)
+
+
+def select_global_hard_samples(
+    weights: np.ndarray,
+    ades: np.ndarray,
+    fdes: np.ndarray,
+    group_to_indices: list,
+    global_thresholds: dict,
+    remove_mask: np.ndarray = None,
+    existing_duplicate_indices: np.ndarray = None,
+    max_per_group: int = 1,
+    max_total: int = 0,
+) -> tuple:
+    """
+    Select hard samples by absolute/global thresholds.
+
+    This is the fallback for groups whose members are all bad: it does not need
+    a within-group outlier. If a group's median global-hard score is >= 1, the
+    worst max_per_group samples are selected from that group.
+    """
+    weights = np.asarray(weights, dtype=np.float64)
+    ades = np.asarray(ades, dtype=np.float64)
+    fdes = np.asarray(fdes, dtype=np.float64)
+    n_total = int(weights.shape[0])
+    if remove_mask is None:
+        remove_mask = np.zeros(n_total, dtype=bool)
+    else:
+        remove_mask = np.asarray(remove_mask, dtype=bool)
+
+    existing = set()
+    if existing_duplicate_indices is not None:
+        existing.update(int(v) for v in np.asarray(existing_duplicate_indices, dtype=np.int64).reshape(-1).tolist())
+
+    hard_weight = max(float(global_thresholds.get("hard_weight", 0.0)), 1e-8)
+    hard_ade = max(float(global_thresholds.get("hard_ade", 0.0)), 1e-8)
+    hard_fde = max(float(global_thresholds.get("hard_fde", 0.0)), 1e-8)
+    score = np.maximum.reduce([weights / hard_weight, ades / hard_ade, fdes / hard_fde])
+    hard_mask = (weights >= hard_weight) | (ades >= hard_ade) | (fdes >= hard_fde)
+
+    rows = []
+    selected = []
+    selected_set = set(existing)
+    per_group = max(0, int(max_per_group))
+    if per_group <= 0:
+        return np.zeros((0,), dtype=np.int64), rows
+
+    for group_id, raw_members in enumerate(group_to_indices):
+        members = np.asarray(raw_members, dtype=np.int64)
+        if members.size == 0:
+            continue
+        members = members[(members >= 0) & (members < n_total)]
+        members = members[~remove_mask[members]]
+        members = np.asarray([int(v) for v in members.tolist() if int(v) not in selected_set], dtype=np.int64)
+        if members.size == 0:
+            continue
+
+        bad_group = bool(np.median(score[members]) >= 1.0)
+        if bad_group:
+            candidates = members
+            reason = "global_bad_group_median"
+        else:
+            candidates = members[hard_mask[members]]
+            reason = "global_hard_sample"
+        if candidates.size == 0:
+            continue
+
+        order = candidates[np.argsort(score[candidates])[::-1]]
+        for sample_idx in order[:per_group].tolist():
+            sample_idx = int(sample_idx)
+            selected.append(sample_idx)
+            selected_set.add(sample_idx)
+            rows.append(
+                {
+                    "group_id": int(group_id),
+                    "sample_idx": sample_idx,
+                    "weight": float(weights[sample_idx]),
+                    "ade": float(ades[sample_idx]),
+                    "fde": float(fdes[sample_idx]),
+                    "global_hard_score": float(score[sample_idx]),
+                    "group_median_global_hard_score": float(np.median(score[members])),
+                    "group_size": int(members.size),
+                    "hard_reason": reason,
+                    "global_hard_weight": float(hard_weight),
+                    "global_hard_ade": float(hard_ade),
+                    "global_hard_fde": float(hard_fde),
+                }
+            )
+
+    if int(max_total) > 0 and len(selected) > int(max_total):
+        selected_arr = np.asarray(selected, dtype=np.int64)
+        keep_order = np.argsort(score[selected_arr])[::-1][: int(max_total)]
+        keep = set(int(v) for v in selected_arr[keep_order].tolist())
+        rows = [row for row in rows if int(row["sample_idx"]) in keep]
+        selected = [int(v) for v in selected_arr[keep_order].tolist()]
+
+    return np.asarray(selected, dtype=np.int64), rows
+
+
 def decode_token_prefix_reconstructions(model, codes, norm_params: dict, prefix_lengths) -> tuple:
     """
     用同一条 token 序列的前 K 个 token 解码，返回 K 和对应重建轨迹。
