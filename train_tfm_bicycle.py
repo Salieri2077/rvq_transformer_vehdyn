@@ -79,7 +79,15 @@ def bicycle_rollout_from_controls(
     x0_f = _as_batch_vector(x0, acc_f, batch_size, 0.0).float()
     y0_f = _as_batch_vector(y0, acc_f, batch_size, 0.0).float()
 
-    v = v0_f.unsqueeze(1) + torch.cumsum(acc_f, dim=1) * dt
+    # Make the indexing explicit:
+    #   v[:, 0] = v0
+    #   v[:, t] = v[:, t-1] + acc[:, t] * dt, t >= 1
+    # This matches the GT target construction where gt_v[:, 0]=dx[:, 0]/dt
+    # and gt_acc[:, 0] is fixed to 0 instead of being used to update v0.
+    v = torch.empty_like(acc_f)
+    v[:, 0] = v0_f
+    if acc_f.shape[1] > 1:
+        v[:, 1:] = v0_f.unsqueeze(1) + torch.cumsum(acc_f[:, 1:], dim=1) * dt
     v = torch.clamp(v, min=-40.0, max=40.0)
 
     yaw = yaw0_f.unsqueeze(1) + torch.cumsum(yaw_rate_f, dim=1) * dt
@@ -175,20 +183,40 @@ def global_xyyaw_to_dxdydyaw(x: torch.Tensor, y: torch.Tensor, yaw: torch.Tensor
 
 
 def get_rollout_horizon(epoch: int, epochs: int, total_steps: int):
-    """Curriculum horizon for rollout losses."""
-    if epoch < 0.2 * epochs:
-        return min(total_steps, 5)
-    if epoch < 0.4 * epochs:
-        return min(total_steps, 10)
-    if epoch < 0.7 * epochs:
-        return min(total_steps, 15)
-    return total_steps
+    """
+    Progressive rollout horizon.
+
+    这个 bicycle 版本不是直接预测 dxdydyaw，而是预测 acc/yaw_rate 后
+    递推积分得到 x/y/yaw。积分时间越长，早期小误差越容易累积放大。
+    因此训练时先只监督短 horizon，再平滑扩展到完整 25 steps≈5s。
+
+    这里不用 5/10/15/T 的硬阶梯，而是用 smoothstep 曲线：
+      - epoch=0 时 H≈5，即先学 1s 短期积分；
+      - 中间随训练进度平滑增长；
+      - 最后 H=T，完整监督 5s rollout。
+    H 仍然需要取整，因为它用于 tensor slicing。
+    """
+    min_steps = min(total_steps, 5)
+    if total_steps <= min_steps:
+        return total_steps
+
+    denom = max(epochs - 1, 1)
+    progress = min(max(epoch / denom, 0.0), 1.0)
+    smooth_progress = progress * progress * (3.0 - 2.0 * progress)
+    horizon = round(min_steps + (total_steps - min_steps) * smooth_progress)
+    return int(min(max(horizon, min_steps), total_steps))
 
 
 class TrajRVQBicycleTransformer(nn.Module):
     """
     RVQ tokenizer whose decoder predicts acc/yaw_rate and reconstructs
     dxdydyaw through a differentiable bicycle-like rollout.
+
+    与 train_tfm.py 的主要区别：
+      - train_tfm.py decoder 直接输出 v/kappa/dy，再组合成 dxdydyaw；
+      - 这里 decoder 只输出两个逐时刻标量控制量 acc 和 yaw_rate；
+      - acc/yaw_rate 结合初始状态 v0，通过可微分 rollout 积分成
+        v/yaw/x/y，再转换回 body-frame dxdydyaw 做重建监督。
     """
 
     def __init__(
@@ -251,6 +279,11 @@ class TrajRVQBicycleTransformer(nn.Module):
         )
 
         # Decoder: transformer trunk plus control heads.
+        # 这里不再直接预测 dx/dy/dyaw，也不预测 v/kappa/dy。
+        # decoder 只负责输出每个时间步的两个标量控制量：
+        #   acc:      [B, T] 纵向加速度
+        #   yaw_rate: [B, T] 航向角速度
+        # 后续轨迹由初始速度 v0 和这两个控制量递推积分得到。
         self.decoder_pos_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         decoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -310,6 +343,8 @@ class TrajRVQBicycleTransformer(nn.Module):
         return self.to_latent(h)
 
     def _decode_controls(self, h_dec: torch.Tensor):
+        # 控制量做 tanh 限幅，避免训练早期 acc/yaw_rate 过大导致
+        # 积分出的速度和位置爆炸。
         acc = self.acc_max * torch.tanh(self.acc_head(h_dec) / self.acc_max)
         yaw_rate = self.yaw_rate_max * torch.tanh(
             self.yaw_rate_head(h_dec) / self.yaw_rate_max
@@ -323,12 +358,20 @@ class TrajRVQBicycleTransformer(nn.Module):
 
         acc, yaw_rate = self._decode_controls(h_dec)
 
+        # 从控制量 rollout 到全局轨迹：
+        #   v_t   = v_{t-1} + acc_t * dt
+        #   yaw_t = yaw_{t-1} + yaw_rate_t * dt
+        #   x/y   = x/y + v_t * [cos(yaw_t), sin(yaw_t)] * dt
+        # 训练 forward 中 v0 来自 GT 初始速度；纯 token decode 时如果
+        # 外部不传 v0，则 rollout 函数会退化为 v0=0。
         x_global, y_global, yaw, v = bicycle_rollout_from_controls(
             acc=acc,
             yaw_rate=yaw_rate,
             v0=v0,
             dt=self.dt,
         )
+        # 评估和下游仍然需要 dxdydyaw，因此把全局 x/y/yaw 再旋回
+        # body-frame delta，并使用训练保存的 norm 参数转回 normalized 空间。
         pred_phys = global_xyyaw_to_dxdydyaw(x_global, y_global, yaw)
         x_recon_norm = self.to_norm(pred_phys)
 
@@ -508,6 +551,9 @@ def train_rvq_bicycle(
 
     for epoch in range(epochs):
         model.train()
+        # Progressive horizon: 模型每次 forward 仍然输出完整 T 步，
+        # 但 loss 先只看前 H 步。这样先把 1s/2s 的短期积分学稳，
+        # 再逐渐扩展到完整 5s，降低长时间积分误差累积带来的训练难度。
         horizon = get_rollout_horizon(epoch, epochs, num_steps)
         smooth_loss_weight = 1e-3 if epoch > 30 else 0.0
 
@@ -540,6 +586,8 @@ def train_rvq_bicycle(
                 gt_phys = model.to_phys(x_norm)
                 gt = compute_gt_bicycle_targets_from_dxdydyaw(gt_phys, dt=dt)
 
+                # 轨迹相关 loss 都只截取当前 curriculum horizon。
+                # H 会随 epoch 从 5/10/15 逐步增长到 T。
                 pred_recon_h = out["x_recon"][:, :horizon]
                 target_recon_h = x_norm[:, :horizon]
 
