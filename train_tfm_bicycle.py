@@ -182,29 +182,97 @@ def global_xyyaw_to_dxdydyaw(x: torch.Tensor, y: torch.Tensor, yaw: torch.Tensor
     return torch.stack([dx_body, dy_body, dyaw], dim=-1)
 
 
-def get_rollout_horizon(epoch: int, epochs: int, total_steps: int):
+def get_rollout_horizon_float(
+    epoch: int,
+    epochs: int,
+    total_steps: int,
+    full_horizon_ratio: float = 0.7,
+):
     """
-    Progressive rollout horizon.
+    Continuous progressive rollout horizon.
 
     这个 bicycle 版本不是直接预测 dxdydyaw，而是预测 acc/yaw_rate 后
     递推积分得到 x/y/yaw。积分时间越长，早期小误差越容易累积放大。
-    因此训练时先只监督短 horizon，再平滑扩展到完整 25 steps≈5s。
+    因此训练时先强调短 horizon，再平滑扩展到完整 25 steps≈5s。
 
-    这里不用 5/10/15/T 的硬阶梯，而是用 smoothstep 曲线：
+    这里用 smoothstep 曲线：
       - epoch=0 时 H≈5，即先学 1s 短期积分；
       - 中间随训练进度平滑增长；
-      - 最后 H=T，完整监督 5s rollout。
-    H 仍然需要取整，因为它用于 tensor slicing。
+      - 默认 70% 训练进度到达 H=T，后 30% 固定完整 5s 训练。
     """
     min_steps = min(total_steps, 5)
     if total_steps <= min_steps:
-        return total_steps
+        return float(total_steps)
 
-    denom = max(epochs - 1, 1)
-    progress = min(max(epoch / denom, 0.0), 1.0)
+    warmup_epochs = max((epochs - 1) * full_horizon_ratio, 1.0)
+    progress = min(max(epoch / warmup_epochs, 0.0), 1.0)
     smooth_progress = progress * progress * (3.0 - 2.0 * progress)
-    horizon = round(min_steps + (total_steps - min_steps) * smooth_progress)
+    return float(min_steps + (total_steps - min_steps) * smooth_progress)
+
+
+def get_rollout_horizon(
+    epoch: int,
+    epochs: int,
+    total_steps: int,
+    full_horizon_ratio: float = 0.7,
+):
+    """Integer horizon used only for logging/metrics labels."""
+    horizon = round(
+        get_rollout_horizon_float(
+            epoch,
+            epochs,
+            total_steps,
+            full_horizon_ratio=full_horizon_ratio,
+        )
+    )
+    min_steps = min(total_steps, 5)
     return int(min(max(horizon, min_steps), total_steps))
+
+
+def get_timestep_loss_weights(
+    epoch: int,
+    epochs: int,
+    total_steps: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    full_horizon_ratio: float = 0.7,
+    future_min_weight: float = 0.05,
+):
+    """
+    Smooth per-timestep curriculum weights for trajectory losses.
+
+    旧做法是 x[:, :H] hard slicing，H 以外 timestep 完全没有梯度；
+    这里让所有 25 步从一开始都参与训练，只是远期 timestep 权重较小。
+    随着 horizon_float 增大，远期权重连续上升，避免某个 epoch
+    第一次“看到”新 step 时产生明显 loss 台阶。
+
+    Returns:
+        weights: [T], first steps near 1, far future >= future_min_weight.
+    """
+    horizon = get_rollout_horizon_float(
+        epoch,
+        epochs,
+        total_steps,
+        full_horizon_ratio=full_horizon_ratio,
+    )
+    step_ids = torch.arange(1, total_steps + 1, device=device, dtype=dtype)
+    horizon_t = torch.tensor(horizon, device=device, dtype=dtype)
+
+    # Linear soft boundary: steps before horizon have weight 1; the next step
+    # ramps in continuously; farther future keeps a small non-zero weight.
+    visible = torch.clamp(horizon_t - step_ids + 1.0, min=0.0, max=1.0)
+    return future_min_weight + (1.0 - future_min_weight) * visible
+
+
+def weighted_mse_loss(pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor):
+    """MSE over [B, T, ...] with per-timestep weights [T]."""
+    err = (pred - target).pow(2)
+    view_shape = [1, weights.shape[0]] + [1] * (err.dim() - 2)
+    w = weights.view(*view_shape)
+    denom = weights.sum() * err.shape[0]
+    for size in err.shape[2:]:
+        denom = denom * size
+    return (err * w).sum() / denom.clamp_min(1e-8)
 
 
 class TrajRVQBicycleTransformer(nn.Module):
@@ -473,6 +541,8 @@ def train_rvq_bicycle(
     dt: float = 0.2,
     acc_max: float = 8.0,
     yaw_rate_max: float = 1.0,
+    full_horizon_ratio: float = 0.7,
+    future_loss_min_weight: float = 0.05,
 ):
     """
     Train the acc/yaw_rate rollout RVQ tokenizer.
@@ -548,13 +618,27 @@ def train_rvq_bicycle(
     yaw_rate_weight = 1.0
 
     max_lateral = 1.0
-
+    # Curriculum settings:
+    # 1) full_horizon_ratio=0.7: 前 70% epoch 平滑扩展到完整 25 steps，
+    #    后 30% 固定完整 5s 训练。
+    # 2) future_loss_min_weight>0: 远期 timestep 从一开始就有少量梯度，
+    #    避免 hard slicing 带来的“新 step 第一次被看到”台阶。
     for epoch in range(epochs):
         model.train()
-        # Progressive horizon: 模型每次 forward 仍然输出完整 T 步，
-        # 但 loss 先只看前 H 步。这样先把 1s/2s 的短期积分学稳，
-        # 再逐渐扩展到完整 5s，降低长时间积分误差累积带来的训练难度。
-        horizon = get_rollout_horizon(epoch, epochs, num_steps)
+        # Progressive horizon 现在只作为“主监督区域”的日志指标；
+        # 实际 trajectory loss 使用全 T 步 per-timestep weights。
+        horizon = get_rollout_horizon(
+            epoch,
+            epochs,
+            num_steps,
+            full_horizon_ratio=full_horizon_ratio,
+        )
+        horizon_float = get_rollout_horizon_float(
+            epoch,
+            epochs,
+            num_steps,
+            full_horizon_ratio=full_horizon_ratio,
+        )
         smooth_loss_weight = 1e-3 if epoch > 30 else 0.0
 
         total_recon = 0.0
@@ -586,32 +670,42 @@ def train_rvq_bicycle(
                 gt_phys = model.to_phys(x_norm)
                 gt = compute_gt_bicycle_targets_from_dxdydyaw(gt_phys, dt=dt)
 
-                # 轨迹相关 loss 都只截取当前 curriculum horizon。
-                # H 会随 epoch 从 5/10/15 逐步增长到 T。
-                pred_recon_h = out["x_recon"][:, :horizon]
-                target_recon_h = x_norm[:, :horizon]
+                step_weights = get_timestep_loss_weights(
+                    epoch,
+                    epochs,
+                    num_steps,
+                    device=x_norm.device,
+                    dtype=x_norm.dtype,
+                    full_horizon_ratio=full_horizon_ratio,
+                    future_min_weight=future_loss_min_weight,
+                )
 
-                mse_dxdy = F.mse_loss(pred_recon_h[..., :2], target_recon_h[..., :2])
-                mse_dyaw = F.mse_loss(pred_recon_h[..., 2], target_recon_h[..., 2])
+                # Trajectory losses use all T steps with smooth timestep weights.
+                # Early training still focuses on the first ~1s, but future steps
+                # are never completely invisible.
+                mse_dxdy = weighted_mse_loss(out["x_recon"][..., :2], x_norm[..., :2], step_weights)
+                mse_dyaw = weighted_mse_loss(out["x_recon"][..., 2], x_norm[..., 2], step_weights)
                 recon_loss = mse_dxdy + 14.0 * mse_dyaw
 
                 xy_loss = (
-                    F.mse_loss(out["x_global"][:, :horizon], gt["gt_x"][:, :horizon])
-                    + F.mse_loss(out["y_global"][:, :horizon], gt["gt_y"][:, :horizon])
+                    weighted_mse_loss(out["x_global"], gt["gt_x"], step_weights)
+                    + weighted_mse_loss(out["y_global"], gt["gt_y"], step_weights)
                 )
-                yaw_loss = F.mse_loss(out["yaw"][:, :horizon], gt["gt_yaw"][:, :horizon])
-                v_loss = F.mse_loss(out["v"][:, :horizon], gt["gt_v"][:, :horizon])
+                yaw_loss = weighted_mse_loss(out["yaw"], gt["gt_yaw"], step_weights)
+
+                # Dynamics/control losses are supervised on the full horizon from
+                # the start. This teaches future acc/yaw_rate/v profiles before
+                # the trajectory loss weight becomes large there.
+                v_loss = F.mse_loss(out["v"], gt["gt_v"])
                 control_loss = (
-                    F.mse_loss(out["acc"][:, :horizon], gt["gt_acc"][:, :horizon])
+                    F.mse_loss(out["acc"], gt["gt_acc"])
                     + yaw_rate_weight
-                    * F.mse_loss(out["yaw_rate"][:, :horizon], gt["gt_yaw_rate"][:, :horizon])
+                    * F.mse_loss(out["yaw_rate"], gt["gt_yaw_rate"])
                 )
 
-                if horizon > 1:
-                    jerk = (out["acc"][:, 1:horizon] - out["acc"][:, : horizon - 1]) / dt
-                    yaw_acc = (
-                        out["yaw_rate"][:, 1:horizon] - out["yaw_rate"][:, : horizon - 1]
-                    ) / dt
+                if num_steps > 1:
+                    jerk = (out["acc"][:, 1:] - out["acc"][:, :-1]) / dt
+                    yaw_acc = (out["yaw_rate"][:, 1:] - out["yaw_rate"][:, :-1]) / dt
                     smooth_loss = jerk.pow(2).mean() + yaw_acc.pow(2).mean()
                 else:
                     smooth_loss = out["acc"].sum() * 0.0
@@ -648,9 +742,11 @@ def train_rvq_bicycle(
             total_loss += loss.item()
 
             with torch.no_grad():
+                # Metrics are reported on the full 5s horizon so they stay
+                # comparable across epochs while the curriculum weights change.
                 step_dist = torch.sqrt(
-                    (out["x_global"][:, :horizon] - gt["gt_x"][:, :horizon]).pow(2)
-                    + (out["y_global"][:, :horizon] - gt["gt_y"][:, :horizon]).pow(2)
+                    (out["x_global"] - gt["gt_x"]).pow(2)
+                    + (out["y_global"] - gt["gt_y"]).pow(2)
                     + 1e-6
                 )
                 batch_size_actual = x_norm.shape[0]
@@ -659,12 +755,12 @@ def train_rvq_bicycle(
                 total_vrr_count += (step_dist.max(dim=1)[0] < max_lateral).sum().item()
                 total_samples += batch_size_actual
 
-                total_acc_mean += out["acc"][:, :horizon].mean().item()
-                total_acc_abs += out["acc"][:, :horizon].abs().mean().item()
-                total_yaw_rate_abs += out["yaw_rate"][:, :horizon].abs().mean().item()
-                total_v_abs += out["v"][:, :horizon].abs().mean().item()
-                running_v_min = min(running_v_min, out["v"][:, :horizon].min().item())
-                running_v_max = max(running_v_max, out["v"][:, :horizon].max().item())
+                total_acc_mean += out["acc"].mean().item()
+                total_acc_abs += out["acc"].abs().mean().item()
+                total_yaw_rate_abs += out["yaw_rate"].abs().mean().item()
+                total_v_abs += out["v"].abs().mean().item()
+                running_v_min = min(running_v_min, out["v"].min().item())
+                running_v_max = max(running_v_max, out["v"].max().item())
 
         scheduler.step()
 
@@ -704,10 +800,13 @@ def train_rvq_bicycle(
         writer.add_scalar("stats/v_min", running_v_min, epoch + 1)
         writer.add_scalar("stats/v_max", running_v_max, epoch + 1)
         writer.add_scalar("train/rollout_horizon", horizon, epoch + 1)
+        writer.add_scalar("train/rollout_horizon_float", horizon_float, epoch + 1)
+        writer.add_scalar("train/future_loss_min_weight", future_loss_min_weight, epoch + 1)
+        writer.add_scalar("train/full_horizon_ratio", full_horizon_ratio, epoch + 1)
 
         if (epoch + 1) % 10 == 0 or epoch == 0 or epoch + 1 == epochs:
             print(
-                f"[BiRVQ] Epoch {epoch+1:03d} | H: {horizon:02d} | "
+                f"[BiRVQ] Epoch {epoch+1:03d} | H: {horizon:02d} ({horizon_float:.1f}) | "
                 f"Recon: {avg_recon:.5f} | XY: {avg_xy:.5f} | "
                 f"Yaw: {avg_yaw:.5f} | V: {avg_v:.5f} | "
                 f"Ctrl: {avg_control:.5f} | Smooth: {avg_smooth:.5f} | "
@@ -730,6 +829,8 @@ def train_rvq_bicycle(
         "num_transformer_layers": num_transformer_layers,
         "acc_max": acc_max,
         "yaw_rate_max": yaw_rate_max,
+        "full_horizon_ratio": full_horizon_ratio,
+        "future_loss_min_weight": future_loss_min_weight,
         "input_steps": num_steps,
         "input_dim": input_dim,
     }
@@ -754,6 +855,8 @@ if __name__ == "__main__":
     parser.add_argument("--dt", type=float, default=0.2)
     parser.add_argument("--acc-max", type=float, default=8.0)
     parser.add_argument("--yaw-rate-max", type=float, default=1.0)
+    parser.add_argument("--full-horizon-ratio", type=float, default=0.7)
+    parser.add_argument("--future-loss-min-weight", type=float, default=0.05)
     args = parser.parse_args()
 
     sampled_trajs = load_sampled_datas(args.data_path)
@@ -767,7 +870,8 @@ if __name__ == "__main__":
         f"Train config | data_type={args.data_type} | num_layers={args.num_layers} | "
         f"num_transformer_layers={args.num_transformer_layers} | batch_size={args.batch_size} | "
         f"epochs={args.epochs} | dt={args.dt} | acc_max={args.acc_max} | "
-        f"yaw_rate_max={args.yaw_rate_max} | save_dir={args.save_dir}"
+        f"yaw_rate_max={args.yaw_rate_max} | full_horizon_ratio={args.full_horizon_ratio} | "
+        f"future_loss_min_weight={args.future_loss_min_weight} | save_dir={args.save_dir}"
     )
     print(f"Dataset shape: {sampled_trajs.shape}")
 
@@ -782,4 +886,6 @@ if __name__ == "__main__":
         dt=args.dt,
         acc_max=args.acc_max,
         yaw_rate_max=args.yaw_rate_max,
+        full_horizon_ratio=args.full_horizon_ratio,
+        future_loss_min_weight=args.future_loss_min_weight,
     )
