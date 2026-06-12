@@ -4,7 +4,7 @@ import os
 import pickle
 import sys
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -134,14 +134,22 @@ def train_rvq_bicycle_adaptive(
     gate_ade_base: float = 0.04,
     gate_ade_per_step: float = 0.01,
     gate_seed: int = 20260610,
+    gate_ignore_scenarios: Optional[List[str]] = None,
+    gate_auto_ignore_stalled: bool = False,
+    gate_stall_patience_epochs: int = 50,
+    gate_stall_min_delta: float = 0.01,
     fps: float = 5.0,
 ):
     """
     Train bicycle RVQ tokenizer with adaptive horizon gate.
 
     The current horizon H is increased only after every non-empty scenario in a
-    fixed balanced gate subset has ADE(H) below threshold(H). If a stage does not
-    pass for max_stage_epochs, H is advanced anyway to avoid a permanent stall.
+    fixed balanced gate subset has ADE(H) below threshold(H). Scenarios in
+    gate_ignore_scenarios are still evaluated/logged, but skipped by the gate
+    pass/fail decision. Optionally, a scenario can also be auto-ignored for the
+    current stage when its ADE has changed very little for a long enough window.
+    If a stage does not pass for max_stage_epochs, H is advanced anyway to avoid
+    a permanent stall.
     """
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -152,6 +160,9 @@ def train_rvq_bicycle_adaptive(
     input_dim = int(data_array.shape[2])
     current_horizon = int(min(max(start_horizon, 1), num_steps))
     horizon_step = int(max(horizon_step, 1))
+    gate_ignore_set = {name.strip() for name in (gate_ignore_scenarios or []) if name.strip()}
+    gate_auto_ignore_set = set()
+    gate_ade_history: Dict[str, List[Tuple[int, int, float]]] = {}
 
     # 1) Normalize and prepare training loader.
     data_normalized = preprocess_and_save_norm_params(data_array, save_dir, data_type)
@@ -167,6 +178,11 @@ def train_rvq_bicycle_adaptive(
     )
     gate_counts = {name: int(len(idxs)) for name, idxs in gate_indices.items()}
     print(f"Gate subset counts: {gate_counts}")
+    if gate_ignore_set:
+        unknown = sorted(gate_ignore_set - set(gate_indices.keys()))
+        print(f"Gate ignored scenarios: {sorted(gate_ignore_set)}")
+        if unknown:
+            print(f"Warning: ignored scenarios not found in gate subset: {unknown}")
     if len(gate_indices) == 0:
         raise RuntimeError("No non-empty scenarios found for gate evaluation.")
 
@@ -421,7 +437,58 @@ def train_rvq_bicycle_adaptive(
                 base=gate_ade_base,
                 per_step=gate_ade_per_step,
             )
-            gate_pass = all(ade <= threshold for ade in scenario_ade.values())
+            for scenario_name, ade in scenario_ade.items():
+                gate_ade_history.setdefault(scenario_name, []).append(
+                    (epoch + 1, current_horizon, float(ade))
+                )
+
+            if gate_auto_ignore_stalled:
+                for scenario_name, ade in scenario_ade.items():
+                    if scenario_name in gate_ignore_set or scenario_name in gate_auto_ignore_set:
+                        continue
+                    if ade <= threshold:
+                        continue
+                    records = [
+                        item
+                        for item in gate_ade_history.get(scenario_name, [])
+                        if item[1] == current_horizon
+                    ]
+                    if not records:
+                        continue
+                    recent = [
+                        item
+                        for item in records
+                        if item[0] >= (epoch + 1 - gate_stall_patience_epochs)
+                    ]
+                    # Gate eval is discrete, e.g. every 4 epochs. A "50 epoch"
+                    # window will usually span 48 epochs in recorded eval points
+                    # (308, 312, ..., 356), so allow one eval interval of slack.
+                    min_span = max(gate_stall_patience_epochs - max(gate_eval_interval, 1), 0)
+                    if recent[-1][0] - recent[0][0] < min_span:
+                        continue
+                    recent_ades = [item[2] for item in recent]
+                    ade_delta = max(recent_ades) - min(recent_ades)
+                    if ade_delta < gate_stall_min_delta:
+                        gate_auto_ignore_set.add(scenario_name)
+                        print(
+                            f"[Gate] Auto-ignore stalled scenario {scenario_name}: "
+                            f"H={current_horizon:02d}, {len(recent)} evals over "
+                            f"{recent[-1][0] - recent[0][0]} epochs, "
+                            f"ade_delta={ade_delta:.4f} < {gate_stall_min_delta:.4f}"
+                        )
+
+            active_ignore_set = gate_ignore_set | gate_auto_ignore_set
+            # Some scenario types can be kept for monitoring/plots while being
+            # excluded from the horizon gate. DirectUTurn is useful this way when
+            # its data distribution makes the global threshold too strict.
+            gate_eval_ade = {
+                name: ade
+                for name, ade in scenario_ade.items()
+                if name not in active_ignore_set
+            }
+            if len(gate_eval_ade) == 0:
+                raise RuntimeError("All gate scenarios are ignored; at least one scenario must remain active.")
+            gate_pass = all(ade <= threshold for ade in gate_eval_ade.values())
             advance = gate_pass or force_advance
             next_horizon = current_horizon
             if advance and current_horizon < num_steps:
@@ -430,8 +497,14 @@ def train_rvq_bicycle_adaptive(
             writer.add_scalar("adaptive/gate_pass", 1.0 if gate_pass else 0.0, epoch + 1)
             writer.add_scalar("adaptive/gate_forced_advance", 1.0 if force_advance else 0.0, epoch + 1)
             writer.add_scalar("adaptive/gate_threshold", threshold, epoch + 1)
+            writer.add_scalar("adaptive/gate_auto_ignore_count", len(gate_auto_ignore_set), epoch + 1)
             for scenario_name, ade in scenario_ade.items():
                 writer.add_scalar(f"adaptive/gate_ade/{scenario_name}", ade, epoch + 1)
+                writer.add_scalar(
+                    f"adaptive/gate_auto_ignored/{scenario_name}",
+                    1.0 if scenario_name in gate_auto_ignore_set else 0.0,
+                    epoch + 1,
+                )
 
             history_item = {
                 "epoch": int(epoch + 1),
@@ -441,16 +514,26 @@ def train_rvq_bicycle_adaptive(
                 "gate_pass": bool(gate_pass),
                 "forced_advance": bool(force_advance),
                 "next_horizon": int(next_horizon),
+                "gate_ignore_scenarios": sorted(gate_ignore_set),
+                "gate_auto_ignore_scenarios": sorted(gate_auto_ignore_set),
+                "gate_active_scenarios": sorted(gate_eval_ade.keys()),
                 "scenario_ade": {k: float(v) for k, v in scenario_ade.items()},
             }
             curriculum_history.append(history_item)
             save_curriculum_history(save_dir, curriculum_history)
 
-            worst_name, worst_ade = max(scenario_ade.items(), key=lambda kv: kv[1])
+            worst_name, worst_ade = max(gate_eval_ade.items(), key=lambda kv: kv[1])
+            ignored_text = ""
+            if active_ignore_set:
+                ignored_text = (
+                    f" | ignored: manual={sorted(gate_ignore_set)}, "
+                    f"auto={sorted(gate_auto_ignore_set)}"
+                )
             print(
                 f"[Gate] Epoch {epoch+1:03d} | H: {current_horizon:02d} | "
                 f"thr: {threshold:.4f} | pass: {gate_pass} | "
-                f"forced: {force_advance} | worst: {worst_name}={worst_ade:.4f}"
+                f"forced: {force_advance} | worst(active): {worst_name}={worst_ade:.4f}"
+                f"{ignored_text}"
             )
 
             if gate_pass and current_horizon >= num_steps:
@@ -461,9 +544,11 @@ def train_rvq_bicycle_adaptive(
             if advance and current_horizon < num_steps:
                 current_horizon = next_horizon
                 stage_epoch = 0
+                gate_auto_ignore_set.clear()
                 print(f"[Gate] Advance to H={current_horizon}")
             elif force_advance:
                 stage_epoch = 0
+                gate_auto_ignore_set.clear()
 
     # Save model and config.
     model_path = os.path.join(save_dir, f"{data_type}_rvq_bicycle_adaptive_model.pth")
@@ -493,6 +578,10 @@ def train_rvq_bicycle_adaptive(
         "gate_ade_base": gate_ade_base,
         "gate_ade_per_step": gate_ade_per_step,
         "gate_seed": gate_seed,
+        "gate_ignore_scenarios": sorted(gate_ignore_set),
+        "gate_auto_ignore_stalled": gate_auto_ignore_stalled,
+        "gate_stall_patience_epochs": gate_stall_patience_epochs,
+        "gate_stall_min_delta": gate_stall_min_delta,
         "fps": fps,
         "gate_counts": gate_counts,
     }
@@ -529,6 +618,22 @@ if __name__ == "__main__":
     parser.add_argument("--gate-ade-base", type=float, default=0.04)
     parser.add_argument("--gate-ade-per-step", type=float, default=0.01)
     parser.add_argument("--gate-seed", type=int, default=20260610)
+    parser.add_argument(
+        "--gate-ignore-scenarios",
+        type=str,
+        default="DirectUTurn",
+        help=(
+            "Comma-separated scenarios to evaluate/log but exclude from gate_pass. "
+            "Use an empty string to include every scenario."
+        ),
+    )
+    parser.add_argument(
+        "--gate-auto-ignore-stalled",
+        action="store_true",
+        help="Auto-ignore scenarios whose gate ADE has plateaued above threshold for the current horizon.",
+    )
+    parser.add_argument("--gate-stall-patience-epochs", type=int, default=50)
+    parser.add_argument("--gate-stall-min-delta", type=float, default=0.01)
     args = parser.parse_args()
 
     sampled_trajs = load_sampled_datas(args.data_path)
@@ -537,6 +642,11 @@ if __name__ == "__main__":
         sampled_trajs = sampled_trajs[:, :14, :]
     if args.max_samples > 0:
         sampled_trajs = sampled_trajs[: args.max_samples]
+    gate_ignore_scenarios = [
+        item.strip()
+        for item in args.gate_ignore_scenarios.split(",")
+        if item.strip()
+    ]
 
     print(
         f"Train config | data_type={args.data_type} | num_layers={args.num_layers} | "
@@ -547,6 +657,10 @@ if __name__ == "__main__":
         f"gate_eval_interval={args.gate_eval_interval} | max_stage_epochs={args.max_stage_epochs} | "
         f"gate_samples_per_scenario={args.gate_samples_per_scenario} | "
         f"gate_ade_base={args.gate_ade_base} | gate_ade_per_step={args.gate_ade_per_step} | "
+        f"gate_ignore_scenarios={gate_ignore_scenarios} | "
+        f"gate_auto_ignore_stalled={args.gate_auto_ignore_stalled} | "
+        f"gate_stall_patience_epochs={args.gate_stall_patience_epochs} | "
+        f"gate_stall_min_delta={args.gate_stall_min_delta} | "
         f"save_dir={args.save_dir}"
     )
     print(f"Dataset shape: {sampled_trajs.shape}")
@@ -571,5 +685,9 @@ if __name__ == "__main__":
         gate_ade_base=args.gate_ade_base,
         gate_ade_per_step=args.gate_ade_per_step,
         gate_seed=args.gate_seed,
+        gate_ignore_scenarios=gate_ignore_scenarios,
+        gate_auto_ignore_stalled=args.gate_auto_ignore_stalled,
+        gate_stall_patience_epochs=args.gate_stall_patience_epochs,
+        gate_stall_min_delta=args.gate_stall_min_delta,
         fps=args.fps,
     )
