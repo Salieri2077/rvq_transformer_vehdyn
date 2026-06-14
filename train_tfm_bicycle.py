@@ -543,6 +543,16 @@ def train_rvq_bicycle(
     yaw_rate_max: float = 1.0,
     full_horizon_ratio: float = 0.7,
     future_loss_min_weight: float = 0.05,
+    final_traj_only: bool = False,
+    late_soft_global_focus: bool = False,
+    late_xy_loss_weight: float = 2.0,
+    late_yaw_loss_weight: float = 3.0,
+    late_v_loss_weight: float = 0.1,
+    late_control_loss_weight: float = 0.05,
+    late_smooth_loss_weight: float = 2e-3,
+    late_endpoint_xy_weight: float = 2.0,
+    late_tail_xy_weight: float = 1.0,
+    late_tail_start_ratio: float = 0.6,
 ):
     """
     Train the acc/yaw_rate rollout RVQ tokenizer.
@@ -550,6 +560,11 @@ def train_rvq_bicycle(
     Args:
         data_array: [N, T, 3] physical-space dxdydyaw.
     """
+    if final_traj_only and late_soft_global_focus:
+        raise ValueError("--final-traj-only and --late-soft-global-focus are mutually exclusive.")
+    if not 0.0 <= late_tail_start_ratio < 1.0:
+        raise ValueError("late_tail_start_ratio should be in [0, 1).")
+
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -618,6 +633,7 @@ def train_rvq_bicycle(
     yaw_rate_weight = 1.0
 
     max_lateral = 1.0
+    tail_start_idx = min(max(int(np.ceil(late_tail_start_ratio * num_steps)), 0), num_steps - 1)
     # Curriculum settings:
     # 1) full_horizon_ratio=0.7: 前 70% epoch 平滑扩展到完整 25 steps，
     #    后 30% 固定完整 5s 训练。
@@ -640,6 +656,21 @@ def train_rvq_bicycle(
             full_horizon_ratio=full_horizon_ratio,
         )
         smooth_loss_weight = 1e-3 if epoch > 30 else 0.0
+        # Optional late-stage fine-tuning: after the curriculum has reached the
+        # full horizon, optimize trajectory reconstruction directly and stop
+        # applying the auxiliary v/acc/yaw_rate/smooth losses.
+        late_stage_active = epoch >= int(epochs * full_horizon_ratio)
+        final_traj_only_active = final_traj_only and late_stage_active
+        late_soft_global_focus_active = late_soft_global_focus and late_stage_active
+        effective_xy_loss_weight = late_xy_loss_weight if late_soft_global_focus_active else xy_loss_weight
+        effective_yaw_loss_weight = late_yaw_loss_weight if late_soft_global_focus_active else yaw_loss_weight
+        effective_v_loss_weight = late_v_loss_weight if late_soft_global_focus_active else v_loss_weight
+        effective_control_loss_weight = (
+            late_control_loss_weight if late_soft_global_focus_active else control_loss_weight
+        )
+        effective_smooth_loss_weight = (
+            late_smooth_loss_weight if late_soft_global_focus_active else smooth_loss_weight
+        )
 
         total_recon = 0.0
         total_xy = 0.0
@@ -647,6 +678,8 @@ def train_rvq_bicycle(
         total_v = 0.0
         total_control = 0.0
         total_smooth = 0.0
+        total_endpoint_xy = 0.0
+        total_tail_xy = 0.0
         total_vq = 0.0
         total_loss = 0.0
 
@@ -692,6 +725,14 @@ def train_rvq_bicycle(
                     + weighted_mse_loss(out["y_global"], gt["gt_y"], step_weights)
                 )
                 yaw_loss = weighted_mse_loss(out["yaw"], gt["gt_yaw"], step_weights)
+                endpoint_xy_loss = (
+                    F.mse_loss(out["x_global"][:, -1], gt["gt_x"][:, -1])
+                    + F.mse_loss(out["y_global"][:, -1], gt["gt_y"][:, -1])
+                )
+                tail_xy_loss = (
+                    F.mse_loss(out["x_global"][:, tail_start_idx:], gt["gt_x"][:, tail_start_idx:])
+                    + F.mse_loss(out["y_global"][:, tail_start_idx:], gt["gt_y"][:, tail_start_idx:])
+                )
 
                 # Dynamics/control losses are supervised on the full horizon from
                 # the start. This teaches future acc/yaw_rate/v profiles before
@@ -711,15 +752,24 @@ def train_rvq_bicycle(
                     smooth_loss = out["acc"].sum() * 0.0
 
                 vq_loss = out["vq_loss"]
-                loss = (
+                traj_loss = (
                     recon_loss_weight * recon_loss
-                    + xy_loss_weight * xy_loss
-                    + yaw_loss_weight * yaw_loss
-                    + v_loss_weight * v_loss
-                    + control_loss_weight * control_loss
-                    + smooth_loss_weight * smooth_loss
-                    + vq_loss_weight * vq_loss
+                    + effective_xy_loss_weight * xy_loss
+                    + effective_yaw_loss_weight * yaw_loss
                 )
+                aux_loss = (
+                    effective_v_loss_weight * v_loss
+                    + effective_control_loss_weight * control_loss
+                    + effective_smooth_loss_weight * smooth_loss
+                )
+                late_global_loss = (
+                    late_endpoint_xy_weight * endpoint_xy_loss
+                    + late_tail_xy_weight * tail_xy_loss
+                ) if late_soft_global_focus_active else endpoint_xy_loss * 0.0
+                if final_traj_only_active:
+                    loss = traj_loss + vq_loss_weight * vq_loss
+                else:
+                    loss = traj_loss + aux_loss + late_global_loss + vq_loss_weight * vq_loss
 
             if use_amp and amp_dtype == torch.float16:
                 scaler.scale(loss).backward()
@@ -738,6 +788,8 @@ def train_rvq_bicycle(
             total_v += v_loss.item()
             total_control += control_loss.item()
             total_smooth += smooth_loss.item()
+            total_endpoint_xy += endpoint_xy_loss.item()
+            total_tail_xy += tail_xy_loss.item()
             total_vq += vq_loss.item()
             total_loss += loss.item()
 
@@ -771,6 +823,8 @@ def train_rvq_bicycle(
         avg_v = total_v / num_batches
         avg_control = total_control / num_batches
         avg_smooth = total_smooth / num_batches
+        avg_endpoint_xy = total_endpoint_xy / num_batches
+        avg_tail_xy = total_tail_xy / num_batches
         avg_vq = total_vq / num_batches
         avg_loss = total_loss / num_batches
 
@@ -788,6 +842,8 @@ def train_rvq_bicycle(
         writer.add_scalar("loss/v", avg_v, epoch + 1)
         writer.add_scalar("loss/control", avg_control, epoch + 1)
         writer.add_scalar("loss/smooth", avg_smooth, epoch + 1)
+        writer.add_scalar("loss/endpoint_xy", avg_endpoint_xy, epoch + 1)
+        writer.add_scalar("loss/tail_xy", avg_tail_xy, epoch + 1)
         writer.add_scalar("loss/vq", avg_vq, epoch + 1)
         writer.add_scalar("loss/total", avg_loss, epoch + 1)
         writer.add_scalar("metrics/ade", avg_ade, epoch + 1)
@@ -803,6 +859,17 @@ def train_rvq_bicycle(
         writer.add_scalar("train/rollout_horizon_float", horizon_float, epoch + 1)
         writer.add_scalar("train/future_loss_min_weight", future_loss_min_weight, epoch + 1)
         writer.add_scalar("train/full_horizon_ratio", full_horizon_ratio, epoch + 1)
+        writer.add_scalar("train/final_traj_only_active", 1.0 if final_traj_only_active else 0.0, epoch + 1)
+        writer.add_scalar(
+            "train/late_soft_global_focus_active",
+            1.0 if late_soft_global_focus_active else 0.0,
+            epoch + 1,
+        )
+        writer.add_scalar("train/effective_xy_loss_weight", effective_xy_loss_weight, epoch + 1)
+        writer.add_scalar("train/effective_yaw_loss_weight", effective_yaw_loss_weight, epoch + 1)
+        writer.add_scalar("train/effective_v_loss_weight", effective_v_loss_weight, epoch + 1)
+        writer.add_scalar("train/effective_control_loss_weight", effective_control_loss_weight, epoch + 1)
+        writer.add_scalar("train/effective_smooth_loss_weight", effective_smooth_loss_weight, epoch + 1)
 
         if (epoch + 1) % 10 == 0 or epoch == 0 or epoch + 1 == epochs:
             print(
@@ -810,8 +877,11 @@ def train_rvq_bicycle(
                 f"Recon: {avg_recon:.5f} | XY: {avg_xy:.5f} | "
                 f"Yaw: {avg_yaw:.5f} | V: {avg_v:.5f} | "
                 f"Ctrl: {avg_control:.5f} | Smooth: {avg_smooth:.5f} | "
+                f"EndXY: {avg_endpoint_xy:.5f} | TailXY: {avg_tail_xy:.5f} | "
                 f"VQ: {avg_vq:.5f} | TrajErr: {avg_ade:.4f} | "
                 f"EndErr: {avg_fde:.4f} | VRR: {vrr:.4f} | "
+                f"FinalTrajOnly: {int(final_traj_only_active)} | "
+                f"LateSoft: {int(late_soft_global_focus_active)} | "
                 f"acc_mean: {avg_acc_mean:.3f} | acc_abs: {avg_acc_abs:.3f} | "
                 f"yaw_rate_abs: {avg_yaw_rate_abs:.3f} | "
                 f"v_min: {running_v_min:.2f} | v_max: {running_v_max:.2f}"
@@ -831,6 +901,17 @@ def train_rvq_bicycle(
         "yaw_rate_max": yaw_rate_max,
         "full_horizon_ratio": full_horizon_ratio,
         "future_loss_min_weight": future_loss_min_weight,
+        "final_traj_only": final_traj_only,
+        "late_soft_global_focus": late_soft_global_focus,
+        "late_xy_loss_weight": late_xy_loss_weight,
+        "late_yaw_loss_weight": late_yaw_loss_weight,
+        "late_v_loss_weight": late_v_loss_weight,
+        "late_control_loss_weight": late_control_loss_weight,
+        "late_smooth_loss_weight": late_smooth_loss_weight,
+        "late_endpoint_xy_weight": late_endpoint_xy_weight,
+        "late_tail_xy_weight": late_tail_xy_weight,
+        "late_tail_start_ratio": late_tail_start_ratio,
+        "late_tail_start_idx": tail_start_idx,
         "input_steps": num_steps,
         "input_dim": input_dim,
     }
@@ -857,7 +938,34 @@ if __name__ == "__main__":
     parser.add_argument("--yaw-rate-max", type=float, default=1.0)
     parser.add_argument("--full-horizon-ratio", type=float, default=0.7)
     parser.add_argument("--future-loss-min-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--final-traj-only",
+        action="store_true",
+        help=(
+            "After full_horizon_ratio of training, optimize only recon/xy/yaw "
+            "trajectory losses plus VQ loss; v/control/smooth remain logged but "
+            "are not backpropagated."
+        ),
+    )
+    parser.add_argument(
+        "--late-soft-global-focus",
+        action="store_true",
+        help=(
+            "After full_horizon_ratio of training, increase global trajectory "
+            "and endpoint/tail losses while keeping smaller dynamics losses."
+        ),
+    )
+    parser.add_argument("--late-xy-loss-weight", type=float, default=2.0)
+    parser.add_argument("--late-yaw-loss-weight", type=float, default=3.0)
+    parser.add_argument("--late-v-loss-weight", type=float, default=0.1)
+    parser.add_argument("--late-control-loss-weight", type=float, default=0.05)
+    parser.add_argument("--late-smooth-loss-weight", type=float, default=2e-3)
+    parser.add_argument("--late-endpoint-xy-weight", type=float, default=2.0)
+    parser.add_argument("--late-tail-xy-weight", type=float, default=1.0)
+    parser.add_argument("--late-tail-start-ratio", type=float, default=0.6)
     args = parser.parse_args()
+    if args.final_traj_only and args.late_soft_global_focus:
+        parser.error("--final-traj-only and --late-soft-global-focus are mutually exclusive.")
 
     sampled_trajs = load_sampled_datas(args.data_path)
     sampled_trajs = np.asarray(sampled_trajs, dtype=np.float32)
@@ -871,7 +979,12 @@ if __name__ == "__main__":
         f"num_transformer_layers={args.num_transformer_layers} | batch_size={args.batch_size} | "
         f"epochs={args.epochs} | dt={args.dt} | acc_max={args.acc_max} | "
         f"yaw_rate_max={args.yaw_rate_max} | full_horizon_ratio={args.full_horizon_ratio} | "
-        f"future_loss_min_weight={args.future_loss_min_weight} | save_dir={args.save_dir}"
+        f"future_loss_min_weight={args.future_loss_min_weight} | "
+        f"final_traj_only={args.final_traj_only} | "
+        f"late_soft_global_focus={args.late_soft_global_focus} | "
+        f"late_endpoint_xy_weight={args.late_endpoint_xy_weight} | "
+        f"late_tail_xy_weight={args.late_tail_xy_weight} | "
+        f"late_tail_start_ratio={args.late_tail_start_ratio} | save_dir={args.save_dir}"
     )
     print(f"Dataset shape: {sampled_trajs.shape}")
 
@@ -888,4 +1001,14 @@ if __name__ == "__main__":
         yaw_rate_max=args.yaw_rate_max,
         full_horizon_ratio=args.full_horizon_ratio,
         future_loss_min_weight=args.future_loss_min_weight,
+        final_traj_only=args.final_traj_only,
+        late_soft_global_focus=args.late_soft_global_focus,
+        late_xy_loss_weight=args.late_xy_loss_weight,
+        late_yaw_loss_weight=args.late_yaw_loss_weight,
+        late_v_loss_weight=args.late_v_loss_weight,
+        late_control_loss_weight=args.late_control_loss_weight,
+        late_smooth_loss_weight=args.late_smooth_loss_weight,
+        late_endpoint_xy_weight=args.late_endpoint_xy_weight,
+        late_tail_xy_weight=args.late_tail_xy_weight,
+        late_tail_start_ratio=args.late_tail_start_ratio,
     )

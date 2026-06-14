@@ -7,25 +7,15 @@ from torch.utils.data import DataLoader, TensorDataset
 
 # 导入你原有的模型和工具函数
 from rvq_model import ResidualVQ
-from utils import load_sampled_datas,load_test_datas
+from utils import load_sampled_datas, load_test_datas, build_scenario_masks, integrate_to_global
 
 from train_tfm import TrajRVQTransformer
 
 
 def _integrate_to_global_np(traj: np.ndarray) -> np.ndarray:
-    dx = traj[:, 0]
-    dy = traj[:, 1]
-    dyaw = traj[:, 2]
-    yaw = np.cumsum(dyaw, axis=0)
-    prev_yaw = np.zeros_like(yaw)
-    if len(yaw) > 1:
-        prev_yaw[1:] = yaw[:-1]
-
-    dx_global = dx * np.cos(prev_yaw) - dy * np.sin(prev_yaw)
-    dy_global = dx * np.sin(prev_yaw) + dy * np.cos(prev_yaw)
-    x_global = np.cumsum(dx_global, axis=0)
-    y_global = np.cumsum(dy_global, axis=0)
-    return np.stack([x_global, y_global], axis=-1)
+    """复用 utils 中的批量接口，这里只做单条轨迹适配。"""
+    out = integrate_to_global(np.asarray(traj, dtype=np.float32)[None, ...])
+    return np.asarray(out[0], dtype=np.float32)
 
 
 def _plot_noise_recon_cases(cases, save_path: str):
@@ -87,39 +77,6 @@ def _plot_noise_recon_cases(cases, save_path: str):
     return saved_paths
 
 
-def _make_vis_bucket_targets(vis_num_cases: int):
-    """分配每个速度分层要抽取的样本数量。"""
-    bucket_names = ["stationary", "low_speed", "mid_speed", "high_speed"]
-    vis_num_cases = max(0, int(vis_num_cases))
-    base = vis_num_cases // len(bucket_names)
-    rem = vis_num_cases % len(bucket_names)
-
-    targets = {name: base for name in bucket_names}
-    # 余量优先给中高速，减少可视化被静止样本主导。
-    rem_order = ["mid_speed", "high_speed", "low_speed", "stationary"]
-    for i in range(rem):
-        targets[rem_order[i]] += 1
-    return targets
-
-
-def _speed_bucket_name(
-    total_path_m: float,
-    mean_speed_mps: float,
-    stationary_path_thr_m: float,
-    stationary_speed_thr_mps: float,
-    low_speed_thr_mps: float,
-    mid_speed_thr_mps: float,
-) -> str:
-    """按轨迹运动强度分层：静止/低速/中速/高速。"""
-    if (total_path_m < stationary_path_thr_m) or (mean_speed_mps < stationary_speed_thr_mps):
-        return "stationary"
-    if mean_speed_mps < low_speed_thr_mps:
-        return "low_speed"
-    if mean_speed_mps < mid_speed_thr_mps:
-        return "mid_speed"
-    return "high_speed"
-
-
 def evaluate_tokenizer_health(
     model: TrajRVQTransformer,
     dataloader: DataLoader,
@@ -155,8 +112,9 @@ def evaluate_tokenizer_health(
     overlap_count_per_layer = torch.zeros(num_layers).to(device)
     exact_match_all_layers = 0  # 记录所有层 Token 都完全一致的极端苛刻情况
     vis_cases = []
-    vis_bucket_targets = _make_vis_bucket_targets(vis_num_cases)
-    vis_bucket_counts = {k: 0 for k in vis_bucket_targets.keys()}
+    vis_scenario_names = None
+    vis_scenario_targets = None
+    vis_scenario_counts = None
 
     print(f"开始评估 Tokenizer 健康度... (注入物理噪声: XY ±{noise_std_xy}m, Yaw ±{noise_std_yaw}rad)")
     if vis_save_path is None:
@@ -210,60 +168,50 @@ def evaluate_tokenizer_health(
             z_noisy = model.encode(x_norm_noisy)
             _, _, codes_noisy = model.rvq(z_noisy) # codes_noisy: [B, num_layers]
 
-            # 可视化样本：按静止/低速/中速/高速分层抽样，避免前几个样本偏置。
-            need = max(0, int(vis_num_cases) - len(vis_cases))
-            if need > 0:
+            # 可视化样本：按 scenario 抽样，每个场景固定抽 1 条。
+            need_more = True
+            if vis_scenario_targets is not None:
+                need_more = any(vis_scenario_counts[k] < vis_scenario_targets[k] for k in vis_scenario_names)
+            if need_more:
                 step_dist = torch.sqrt(torch.clamp(x_phys[..., 0] ** 2 + x_phys[..., 1] ** 2, min=0.0))
                 total_path = step_dist.sum(dim=1).detach().cpu().numpy()
                 mean_speed = (step_dist.mean(dim=1) / max(float(vis_dt), 1e-6)).detach().cpu().numpy()
+                x_phys_np = x_phys.detach().cpu().numpy()
+
+                categories, _ = build_scenario_masks(x_phys_np, fps=1.0 / max(float(vis_dt), 1e-6))
+                base_scenarios = list(categories.keys())
+                if vis_scenario_names is None:
+                    vis_scenario_names = base_scenarios + ["Other"]
+                    vis_scenario_targets = {k: 1 for k in vis_scenario_names}
+                    vis_scenario_counts = {k: 0 for k in vis_scenario_names}
 
                 selected_j = []
-                selected_bucket = []
+                selected_scenario = []
                 selected_total_path = []
                 selected_mean_speed = []
 
-                # 第一阶段：优先满足每个分层的 quota。
-                for j in range(B):
-                    if len(vis_cases) + len(selected_j) >= int(vis_num_cases):
-                        break
-                    bucket = _speed_bucket_name(
-                        total_path_m=float(total_path[j]),
-                        mean_speed_mps=float(mean_speed[j]),
-                        stationary_path_thr_m=float(vis_stationary_path_thr_m),
-                        stationary_speed_thr_mps=float(vis_stationary_speed_thr_mps),
-                        low_speed_thr_mps=float(vis_low_speed_thr_mps),
-                        mid_speed_thr_mps=float(vis_mid_speed_thr_mps),
-                    )
-                    if vis_bucket_counts[bucket] >= vis_bucket_targets[bucket]:
+                # 将 batch 内样本映射到 scenario 名称（未命中任何 mask 则归为 Other）。
+                scenario_of_sample = np.asarray(["Other"] * B, dtype=object)
+                unassigned = np.ones((B,), dtype=bool)
+                for name in base_scenarios:
+                    mask = np.asarray(categories.get(name, np.zeros((B,), dtype=bool)), dtype=bool)
+                    hit = mask & unassigned
+                    scenario_of_sample[hit] = str(name)
+                    unassigned[hit] = False
+
+                # 每个场景只取 1 张图。
+                for scenario_name in vis_scenario_names:
+                    if vis_scenario_counts[scenario_name] >= vis_scenario_targets[scenario_name]:
                         continue
+                    candidate = np.flatnonzero(scenario_of_sample == scenario_name)
+                    if candidate.size == 0:
+                        continue
+                    j = int(candidate[0])
                     selected_j.append(j)
-                    selected_bucket.append(bucket)
+                    selected_scenario.append(str(scenario_name))
                     selected_total_path.append(float(total_path[j]))
                     selected_mean_speed.append(float(mean_speed[j]))
-                    vis_bucket_counts[bucket] += 1
-
-                # 第二阶段：若某些分层样本不足，剩余额度用本 batch 其它样本补齐。
-                if len(vis_cases) + len(selected_j) < int(vis_num_cases):
-                    selected_set = set(selected_j)
-                    for j in range(B):
-                        if len(vis_cases) + len(selected_j) >= int(vis_num_cases):
-                            break
-                        if j in selected_set:
-                            continue
-                        bucket = _speed_bucket_name(
-                            total_path_m=float(total_path[j]),
-                            mean_speed_mps=float(mean_speed[j]),
-                            stationary_path_thr_m=float(vis_stationary_path_thr_m),
-                            stationary_speed_thr_mps=float(vis_stationary_speed_thr_mps),
-                            low_speed_thr_mps=float(vis_low_speed_thr_mps),
-                            mid_speed_thr_mps=float(vis_mid_speed_thr_mps),
-                        )
-                        selected_j.append(j)
-                        selected_bucket.append(bucket)
-                        selected_total_path.append(float(total_path[j]))
-                        selected_mean_speed.append(float(mean_speed[j]))
-                        vis_bucket_counts[bucket] += 1
-                        selected_set.add(j)
+                    vis_scenario_counts[scenario_name] += 1
 
                 if len(selected_j) > 0:
                     sel_tensor = torch.as_tensor(selected_j, device=x_norm.device, dtype=torch.long)
@@ -279,7 +227,7 @@ def evaluate_tokenizer_health(
                         vis_cases.append(
                             {
                                 "sample_idx": int(batch_start_idx + j),
-                                "bucket": str(selected_bucket[k]),
+                                "bucket": str(selected_scenario[k]),
                                 "mean_speed_mps": float(selected_mean_speed[k]),
                                 "total_path_length_m": float(selected_total_path[k]),
                                 "gt_phys": x_phys[j].detach().cpu().numpy(),
@@ -370,9 +318,10 @@ def evaluate_tokenizer_health(
     # 画在一个画布上：clean/noisy 重建 + 各自 token 激活值
     saved_paths = _plot_noise_recon_cases(vis_cases, vis_save_path)
     if len(saved_paths) > 0:
-        print("可视化分层抽样统计:")
-        for k in ["stationary", "low_speed", "mid_speed", "high_speed"]:
-            print(f"  - {k}: {int(vis_bucket_counts.get(k, 0))}/{int(vis_bucket_targets.get(k, 0))}")
+        print("可视化场景抽样统计:")
+        if vis_scenario_names is not None:
+            for k in vis_scenario_names:
+                print(f"  - {k}: {int(vis_scenario_counts.get(k, 0))}/{int(vis_scenario_targets.get(k, 0))}")
         print(f"已保存可视化对比图(每样本一张): {os.path.dirname(saved_paths[0])}")
         print(f"图像数量: {len(saved_paths)}，文件前缀: {os.path.basename(vis_save_path)}")
     print("="*50 + "\n")
