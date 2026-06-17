@@ -684,6 +684,18 @@ def load_bicycle_config(model_path: str, data_type: str) -> Dict[str, float]:
         return json.load(f)
 
 
+def load_taae_config(model_path: str, data_type: str) -> Dict[str, float]:
+    """Load optional TAAE config saved by train_tfm.py."""
+    config_path = os.path.join(
+        os.path.dirname(model_path),
+        f"{data_type}_rvq_taae_config.json",
+    )
+    if not os.path.exists(config_path):
+        return {}
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def build_model(
     model_path: str,
     input_steps: int,
@@ -694,6 +706,8 @@ def build_model(
     dt: float = 0.2,
     acc_max: float = 8.0,
     yaw_rate_max: float = 1.0,
+    rvq_type: str = "residual",
+    rvq_scales=None,
 ) -> ModelUnion:
     state_dict = torch.load(model_path, map_location=device)
     if int(num_layers) <= 0:
@@ -730,6 +744,8 @@ def build_model(
             dt=dt,
             acc_max=acc_max,
             yaw_rate_max=yaw_rate_max,
+            rvq_type=rvq_type,
+            rvq_scales=rvq_scales,
         ).to(device)
     else:
         model = TrajRVQTransformer(
@@ -740,6 +756,8 @@ def build_model(
             d_model=128,
             nhead=4,
             num_transformer_layers=num_transformer_layers,
+            rvq_type=rvq_type,
+            rvq_scales=rvq_scales,
         ).to(device)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
@@ -806,14 +824,22 @@ def main():
             model_path = taae_path
 
     resolved_model_type = infer_model_type(model_path, args.model_type)
-    bicycle_config = load_bicycle_config(model_path, args.data_type) if resolved_model_type == "bicycle" else {}
-    eval_dt = float(bicycle_config.get("dt", args.dt))
-    eval_num_layers = int(bicycle_config.get("num_layers", args.num_layers))
+    if resolved_model_type == "bicycle":
+        model_config = load_bicycle_config(model_path, args.data_type)
+    elif resolved_model_type == "taae":
+        model_config = load_taae_config(model_path, args.data_type)
+    else:
+        model_config = {}
+
+    eval_dt = float(model_config.get("dt", args.dt))
+    eval_num_layers = int(model_config.get("num_layers", args.num_layers))
     eval_num_transformer_layers = int(
-        bicycle_config.get("num_transformer_layers", args.num_transformer_layers)
+        model_config.get("num_transformer_layers", args.num_transformer_layers)
     )
-    eval_acc_max = float(bicycle_config.get("acc_max", args.acc_max))
-    eval_yaw_rate_max = float(bicycle_config.get("yaw_rate_max", args.yaw_rate_max))
+    eval_acc_max = float(model_config.get("acc_max", args.acc_max))
+    eval_yaw_rate_max = float(model_config.get("yaw_rate_max", args.yaw_rate_max))
+    eval_rvq_type = model_config.get("rvq_type", "residual")
+    eval_rvq_scales = model_config.get("rvq_scales", None)
     norm_path = os.path.join(args.save_dir, f"{args.data_type}_norm_params.pkl")
     output_dir = args.output_dir or os.path.join(args.save_dir, "scenario_eval")
     os.makedirs(output_dir, exist_ok=True)
@@ -832,6 +858,8 @@ def main():
         dt=eval_dt,
         acc_max=eval_acc_max,
         yaw_rate_max=eval_yaw_rate_max,
+        rvq_type=eval_rvq_type,
+        rvq_scales=eval_rvq_scales,
     )
     norm_params = load_norm_params(norm_path, device)
     model.set_norm_params(norm_params["mean"], norm_params["std"], norm_params["scale_factor"])

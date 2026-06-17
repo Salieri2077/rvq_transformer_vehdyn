@@ -1,6 +1,7 @@
 import os
 import pickle
 import argparse
+import json
 
 import numpy as np
 import torch
@@ -11,7 +12,13 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 
-from rvq_model import ResidualVQ
+from rvq_model import (
+    _resize_temporal,
+    build_residual_vq,
+    is_multi_scale_rvq,
+    make_default_multiscale_scales,
+    parse_rvq_scales,
+)
 from utils import (
     preprocess_and_save_norm_params,
     load_sampled_datas,
@@ -181,6 +188,8 @@ class TrajRVQTransformer(nn.Module):
         nhead: int = 4,
         num_transformer_layers: int = 2,
         dt: float = 0.2,
+        rvq_type: str = "residual",
+        rvq_scales=None,
     ):
         super().__init__()
 
@@ -193,10 +202,23 @@ class TrajRVQTransformer(nn.Module):
         self.nhead = nhead
         self.num_transformer_layers = num_transformer_layers
         self.dt = dt
+        self.rvq_type = rvq_type
+        self.use_temporal_rvq = is_multi_scale_rvq(rvq_type)
+        parsed_scales = parse_rvq_scales(rvq_scales)
+        if self.use_temporal_rvq and parsed_scales is None:
+            token_budget = min(max(num_layers, 3), 15)
+            parsed_scales = make_default_multiscale_scales(token_budget, num_scales=3)
+        self.rvq_scales = parsed_scales
+        self.latent_steps = int(self.rvq_scales[-1]) if self.use_temporal_rvq else 1
+        self.rvq_num_quantizers = len(self.rvq_scales) if self.use_temporal_rvq else num_layers
 
         # --- Encoder: 展平轨迹后用 TransformerEncoder 处理 ---
-        self.input_proj = nn.Linear(self.input_flat_dim, d_model)
-        self.pos_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        if self.use_temporal_rvq:
+            self.input_proj = nn.Linear(self.input_flat_dim, self.latent_steps * d_model)
+            self.pos_embed = nn.Parameter(torch.randn(1, self.latent_steps, d_model) * 0.02)
+        else:
+            self.input_proj = nn.Linear(self.input_flat_dim, d_model)
+            self.pos_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -217,16 +239,21 @@ class TrajRVQTransformer(nn.Module):
         )
 
         # --- RVQ 瓶颈 ---
-        self.rvq = ResidualVQ(
-            num_quantizers=num_layers,
+        self.rvq = build_residual_vq(
+            rvq_type=rvq_type,
+            num_quantizers=self.rvq_num_quantizers,
             num_embeddings=vocab_size,
             embedding_dim=d_model,
             dropout=0.2,
             commitment_cost=0.25,
+            rvq_scales=self.rvq_scales,
         )
 
         # --- Decoder: Transformer + 运动学 heads ---
-        self.decoder_pos_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        if self.use_temporal_rvq:
+            self.decoder_pos_embed = nn.Parameter(torch.randn(1, self.latent_steps, d_model) * 0.02)
+        else:
+            self.decoder_pos_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
         decoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -241,9 +268,14 @@ class TrajRVQTransformer(nn.Module):
         )
 
         # 运动学参数 heads（输出物理空间的 v / κ / dy）
-        self.v_head = nn.Linear(d_model, input_steps)
-        self.kappa_head = nn.Linear(d_model, input_steps)
-        self.dy_head = nn.Linear(d_model, input_steps)
+        if self.use_temporal_rvq:
+            self.v_head = nn.Linear(d_model, 1)
+            self.kappa_head = nn.Linear(d_model, 1)
+            self.dy_head = nn.Linear(d_model, 1)
+        else:
+            self.v_head = nn.Linear(d_model, input_steps)
+            self.kappa_head = nn.Linear(d_model, input_steps)
+            self.dy_head = nn.Linear(d_model, input_steps)
 
         # v_head 偏置初始化为 ~10 m/s（典型行驶速度），加速收敛
         nn.init.constant_(self.v_head.bias, 10.0)
@@ -275,9 +307,15 @@ class TrajRVQTransformer(nn.Module):
             v:       [B, T]    - 带符号的纵向速度 profile (m/s)，允许为负，表示倒车
             kappa:   [B, T]    - 曲率 profile (1/m)，用于外部 smoothness loss
         """
-        v = 40.0 * torch.tanh(self.v_head(h_dec) / 40.0)       # [B, T] 带符号纵向速度，限幅避免速度爆炸
-        kappa = torch.tanh(self.kappa_head(h_dec)) * 0.5        # [B, T] 曲率，[-0.5, 0.5] 1/m
-        dy_phys = self.dy_head(h_dec) * 0.01                    # [B, T] 横向，量级 ~mm
+        if h_dec.dim() == 3:
+            h_dec = _resize_temporal(h_dec, self.input_steps)
+            v = 40.0 * torch.tanh(self.v_head(h_dec).squeeze(-1) / 40.0)
+            kappa = torch.tanh(self.kappa_head(h_dec).squeeze(-1)) * 0.5
+            dy_phys = self.dy_head(h_dec).squeeze(-1) * 0.01
+        else:
+            v = 40.0 * torch.tanh(self.v_head(h_dec) / 40.0)       # [B, T] 带符号纵向速度，限幅避免速度爆炸
+            kappa = torch.tanh(self.kappa_head(h_dec)) * 0.5        # [B, T] 曲率，[-0.5, 0.5] 1/m
+            dy_phys = self.dy_head(h_dec) * 0.01                    # [B, T] 横向，量级 ~mm
 
         dx_phys = v * self.dt                                   # [B, T]
         dyaw_phys = v * kappa * self.dt                         # [B, T]
@@ -299,12 +337,27 @@ class TrajRVQTransformer(nn.Module):
 
         x_flat = x.view(B, self.input_flat_dim)
         h = self.input_proj(x_flat)
-        h = h.unsqueeze(1)
+        if self.use_temporal_rvq:
+            h = h.view(B, self.latent_steps, self.d_model)
+        else:
+            h = h.unsqueeze(1)
         h = h + self.pos_embed
         h = self.transformer_encoder(h)
-        h = h.squeeze(1)
+        if not self.use_temporal_rvq:
+            h = h.squeeze(1)
         z = self.to_latent(h)
         return z
+
+    def _decode_from_quantized_latent(self, z_q: torch.Tensor):
+        if z_q.dim() == 3:
+            h_dec = z_q
+        else:
+            h_dec = z_q.unsqueeze(1)
+        h_dec = h_dec + self.decoder_pos_embed
+        h_dec = self.transformer_decoder(h_dec)
+        if not self.use_temporal_rvq:
+            h_dec = h_dec.squeeze(1)
+        return self._kinematic_decode(h_dec)
 
     def decode_from_codes(self, codes: torch.Tensor):
         """
@@ -312,14 +365,9 @@ class TrajRVQTransformer(nn.Module):
         codes: [B, num_layers]
         返回: x_recon: [B, T, 3] (归一化空间)
         """
-        z_q = self.rvq.decode_from_codes(codes)
-
-        h_dec = z_q.unsqueeze(1)
-        h_dec = h_dec + self.decoder_pos_embed
-        h_dec = self.transformer_decoder(h_dec)
-        h_dec = h_dec.squeeze(1)
-
-        x_recon, _, _ = self._kinematic_decode(h_dec)
+        output_length = self.latent_steps if self.use_temporal_rvq else None
+        z_q = self.rvq.decode_from_codes(codes, output_length=output_length)
+        x_recon, _, _ = self._decode_from_quantized_latent(z_q)
         return x_recon
 
     def forward(self, x: torch.Tensor):
@@ -334,13 +382,7 @@ class TrajRVQTransformer(nn.Module):
         """
         z = self.encode(x)
         z_q, vq_loss, codes = self.rvq(z)
-
-        h_dec = z_q.unsqueeze(1)
-        h_dec = h_dec + self.decoder_pos_embed
-        h_dec = self.transformer_decoder(h_dec)
-        h_dec = h_dec.squeeze(1)
-
-        x_recon, v, kappa = self._kinematic_decode(h_dec)
+        x_recon, v, kappa = self._decode_from_quantized_latent(z_q)
 
         return x_recon, vq_loss, codes, v, kappa
 
@@ -353,6 +395,8 @@ def train_rvq_taae(
     num_layers: int = 15,
     num_transformer_layers: int = 2,
     epochs: int = 500,
+    rvq_type: str = "residual",
+    rvq_scales=None,
 ):
     """
     使用 TAAE 结构训练 RVQ 模型，整体流程与 train.py 中的 train_rvq 类似，
@@ -393,6 +437,8 @@ def train_rvq_taae(
         d_model=128,  # 128
         nhead=4,  # 4
         num_transformer_layers=num_transformer_layers,
+        rvq_type=rvq_type,
+        rvq_scales=rvq_scales,
     ).to(device)
     
     # 使用 torch.compile 加速（PyTorch 2.0+，可提升 20-30% 速度）
@@ -468,6 +514,11 @@ def train_rvq_taae(
     model.set_norm_params(mean, std, scale_factor)
     print(f"Norm params set: mean={mean.squeeze().cpu().numpy()}, "
           f"std={std.squeeze().cpu().numpy()}, scale={scale_factor.squeeze().cpu().numpy()}")
+    print(
+        f"RVQ resolved config: rvq_type={model.rvq_type}, "
+        f"rvq_scales={model.rvq_scales}, latent_steps={model.latent_steps}, "
+        f"rvq_num_quantizers={model.rvq_num_quantizers}"
+    )
 
     print("Start Training (Kinematic RVQ Transformer)...")
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -668,6 +719,23 @@ def train_rvq_taae(
         model.state_dict(),
         os.path.join(save_dir, f"{data_type}_rvq_taae_model.pth"),
     )
+    config = {
+        "model_type": "TrajRVQTransformer",
+        "input_steps": num_steps,
+        "input_dim": data_array.shape[2],
+        "num_layers": num_layers,
+        "vocab_size": 1024,
+        "d_model": 128,
+        "nhead": 4,
+        "num_transformer_layers": num_transformer_layers,
+        "dt": model.dt,
+        "rvq_type": rvq_type,
+        "rvq_scales": list(model.rvq_scales or []),
+        "rvq_num_quantizers": model.rvq_num_quantizers,
+        "latent_steps": model.latent_steps,
+    }
+    with open(os.path.join(save_dir, f"{data_type}_rvq_taae_config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
     print(f"TAAE Training Done. Model saved to {save_dir}")
     writer.close()
 
@@ -682,6 +750,23 @@ if __name__ == "__main__":
     parser.add_argument("--num-transformer-layers", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument(
+        "--rvq-type",
+        type=str,
+        default="residual",
+        choices=["residual", "rvq", "multi_scale", "multiscale", "mutil_scale", "mutilscale"],
+        help="RVQ bottleneck type. Use multi_scale for SnapMoGen-style shared-codebook multi-scale RVQ.",
+    )
+    parser.add_argument(
+        "--rvq-scales",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated temporal scales for multi_scale RVQ, e.g. '3,5,7'. "
+            "If omitted, --num-layers is treated as total token budget, clamped to [3, 15], "
+            "and defaults to 3 scales."
+        ),
+    )
     args = parser.parse_args()
 
     sampled_trajs = load_sampled_datas(args.data_path)
@@ -693,7 +778,8 @@ if __name__ == "__main__":
     print(
         f"Train config | data_type={args.data_type} | num_layers={args.num_layers} | "
         f"num_transformer_layers={args.num_transformer_layers} | "
-        f"batch_size={args.batch_size} | epochs={args.epochs} | save_dir={args.save_dir}"
+        f"batch_size={args.batch_size} | epochs={args.epochs} | rvq_type={args.rvq_type} | "
+        f"rvq_scales={args.rvq_scales} | save_dir={args.save_dir}"
     )
     print(f"Dataset shape: {sampled_trajs.shape}")
 
@@ -705,4 +791,6 @@ if __name__ == "__main__":
         num_layers=args.num_layers,
         num_transformer_layers=args.num_transformer_layers,
         epochs=args.epochs,
+        rvq_type=args.rvq_type,
+        rvq_scales=args.rvq_scales,
     )

@@ -19,7 +19,13 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
-from rvq_model import ResidualVQ
+from rvq_model import (
+    _resize_temporal,
+    build_residual_vq,
+    is_multi_scale_rvq,
+    make_default_multiscale_scales,
+    parse_rvq_scales,
+)
 from utils import preprocess_and_save_norm_params, load_sampled_datas
 
 
@@ -299,6 +305,8 @@ class TrajRVQBicycleTransformer(nn.Module):
         dt: float = 0.2,
         acc_max: float = 8.0,
         yaw_rate_max: float = 1.0,
+        rvq_type: str = "residual",
+        rvq_scales=None,
     ):
         super().__init__()
 
@@ -313,10 +321,23 @@ class TrajRVQBicycleTransformer(nn.Module):
         self.dt = dt
         self.acc_max = acc_max
         self.yaw_rate_max = yaw_rate_max
+        self.rvq_type = rvq_type
+        self.use_temporal_rvq = is_multi_scale_rvq(rvq_type)
+        parsed_scales = parse_rvq_scales(rvq_scales)
+        if self.use_temporal_rvq and parsed_scales is None:
+            token_budget = min(max(num_layers, 3), 15)
+            parsed_scales = make_default_multiscale_scales(token_budget, num_scales=3)
+        self.rvq_scales = parsed_scales
+        self.latent_steps = int(self.rvq_scales[-1]) if self.use_temporal_rvq else 1
+        self.rvq_num_quantizers = len(self.rvq_scales) if self.use_temporal_rvq else num_layers
 
         # Encoder: same structure as TrajRVQTransformer.
-        self.input_proj = nn.Linear(self.input_flat_dim, d_model)
-        self.pos_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        if self.use_temporal_rvq:
+            self.input_proj = nn.Linear(self.input_flat_dim, self.latent_steps * d_model)
+            self.pos_embed = nn.Parameter(torch.randn(1, self.latent_steps, d_model) * 0.02)
+        else:
+            self.input_proj = nn.Linear(self.input_flat_dim, d_model)
+            self.pos_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -338,12 +359,14 @@ class TrajRVQBicycleTransformer(nn.Module):
         )
 
         # RVQ bottleneck.
-        self.rvq = ResidualVQ(
-            num_quantizers=num_layers,
+        self.rvq = build_residual_vq(
+            rvq_type=rvq_type,
+            num_quantizers=self.rvq_num_quantizers,
             num_embeddings=vocab_size,
             embedding_dim=d_model,
             dropout=0.2,
             commitment_cost=0.25,
+            rvq_scales=self.rvq_scales,
         )
 
         # Decoder: transformer trunk plus control heads.
@@ -352,7 +375,10 @@ class TrajRVQBicycleTransformer(nn.Module):
         #   acc:      [B, T] 纵向加速度
         #   yaw_rate: [B, T] 航向角速度
         # 后续轨迹由初始速度 v0 和这两个控制量递推积分得到。
-        self.decoder_pos_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        if self.use_temporal_rvq:
+            self.decoder_pos_embed = nn.Parameter(torch.randn(1, self.latent_steps, d_model) * 0.02)
+        else:
+            self.decoder_pos_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         decoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -366,8 +392,12 @@ class TrajRVQBicycleTransformer(nn.Module):
             num_layers=num_transformer_layers,
         )
 
-        self.acc_head = nn.Linear(d_model, input_steps)
-        self.yaw_rate_head = nn.Linear(d_model, input_steps)
+        if self.use_temporal_rvq:
+            self.acc_head = nn.Linear(d_model, 1)
+            self.yaw_rate_head = nn.Linear(d_model, 1)
+        else:
+            self.acc_head = nn.Linear(d_model, input_steps)
+            self.yaw_rate_head = nn.Linear(d_model, input_steps)
 
         # Normalization buffers saved with state_dict.
         self.register_buffer("norm_mean", torch.zeros(1, 1, 3))
@@ -405,24 +435,40 @@ class TrajRVQBicycleTransformer(nn.Module):
             )
 
         x_flat = x_norm.view(batch_size, self.input_flat_dim)
-        h = self.input_proj(x_flat).unsqueeze(1)
+        h = self.input_proj(x_flat)
+        if self.use_temporal_rvq:
+            h = h.view(batch_size, self.latent_steps, self.d_model)
+        else:
+            h = h.unsqueeze(1)
         h = h + self.pos_embed
-        h = self.transformer_encoder(h).squeeze(1)
+        h = self.transformer_encoder(h)
+        if not self.use_temporal_rvq:
+            h = h.squeeze(1)
         return self.to_latent(h)
 
     def _decode_controls(self, h_dec: torch.Tensor):
         # 控制量做 tanh 限幅，避免训练早期 acc/yaw_rate 过大导致
         # 积分出的速度和位置爆炸。
-        acc = self.acc_max * torch.tanh(self.acc_head(h_dec) / self.acc_max)
-        yaw_rate = self.yaw_rate_max * torch.tanh(
-            self.yaw_rate_head(h_dec) / self.yaw_rate_max
-        )
+        if h_dec.dim() == 3:
+            h_dec = _resize_temporal(h_dec, self.input_steps)
+            acc_raw = self.acc_head(h_dec).squeeze(-1)
+            yaw_rate_raw = self.yaw_rate_head(h_dec).squeeze(-1)
+        else:
+            acc_raw = self.acc_head(h_dec)
+            yaw_rate_raw = self.yaw_rate_head(h_dec)
+        acc = self.acc_max * torch.tanh(acc_raw / self.acc_max)
+        yaw_rate = self.yaw_rate_max * torch.tanh(yaw_rate_raw / self.yaw_rate_max)
         return acc, yaw_rate
 
     def _decode_from_latent(self, z_q: torch.Tensor, v0=None):
-        h_dec = z_q.unsqueeze(1)
+        if z_q.dim() == 3:
+            h_dec = z_q
+        else:
+            h_dec = z_q.unsqueeze(1)
         h_dec = h_dec + self.decoder_pos_embed
-        h_dec = self.transformer_decoder(h_dec).squeeze(1)
+        h_dec = self.transformer_decoder(h_dec)
+        if not self.use_temporal_rvq:
+            h_dec = h_dec.squeeze(1)
 
         acc, yaw_rate = self._decode_controls(h_dec)
 
@@ -462,7 +508,8 @@ class TrajRVQBicycleTransformer(nn.Module):
         decoding has no context, so v0 defaults to 0 unless the caller passes it.
         The default return value is [B, T, 3] to match existing eval helpers.
         """
-        z_q = self.rvq.decode_from_codes(codes)
+        output_length = self.latent_steps if self.use_temporal_rvq else None
+        z_q = self.rvq.decode_from_codes(codes, output_length=output_length)
         out = self._decode_from_latent(z_q, v0=v0)
         if return_dict:
             return out
@@ -553,6 +600,8 @@ def train_rvq_bicycle(
     late_endpoint_xy_weight: float = 2.0,
     late_tail_xy_weight: float = 1.0,
     late_tail_start_ratio: float = 0.6,
+    rvq_type: str = "residual",
+    rvq_scales=None,
 ):
     """
     Train the acc/yaw_rate rollout RVQ tokenizer.
@@ -587,6 +636,8 @@ def train_rvq_bicycle(
         dt=dt,
         acc_max=acc_max,
         yaw_rate_max=yaw_rate_max,
+        rvq_type=rvq_type,
+        rvq_scales=rvq_scales,
     ).to(device)
 
     norm_path = os.path.join(save_dir, f"{data_type}_norm_params.pkl")
@@ -600,6 +651,11 @@ def train_rvq_bicycle(
     print(
         f"Norm params set: mean={mean.squeeze().cpu().numpy()}, "
         f"std={std.squeeze().cpu().numpy()}, scale={scale_factor.squeeze().cpu().numpy()}"
+    )
+    print(
+        f"RVQ resolved config: rvq_type={model.rvq_type}, "
+        f"rvq_scales={model.rvq_scales}, latent_steps={model.latent_steps}, "
+        f"rvq_num_quantizers={model.rvq_num_quantizers}"
     )
 
     use_amp = torch.cuda.is_available()
@@ -914,6 +970,10 @@ def train_rvq_bicycle(
         "late_tail_start_idx": tail_start_idx,
         "input_steps": num_steps,
         "input_dim": input_dim,
+        "rvq_type": rvq_type,
+        "rvq_scales": list(model.rvq_scales or []),
+        "rvq_num_quantizers": model.rvq_num_quantizers,
+        "latent_steps": model.latent_steps,
     }
     with open(os.path.join(save_dir, f"{data_type}_rvq_bicycle_config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
@@ -963,6 +1023,23 @@ if __name__ == "__main__":
     parser.add_argument("--late-endpoint-xy-weight", type=float, default=2.0)
     parser.add_argument("--late-tail-xy-weight", type=float, default=1.0)
     parser.add_argument("--late-tail-start-ratio", type=float, default=0.6)
+    parser.add_argument(
+        "--rvq-type",
+        type=str,
+        default="residual",
+        choices=["residual", "rvq", "multi_scale", "multiscale", "mutil_scale", "mutilscale"],
+        help="RVQ bottleneck type. Use multi_scale for SnapMoGen-style shared-codebook multi-scale RVQ.",
+    )
+    parser.add_argument(
+        "--rvq-scales",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated temporal scales for multi_scale RVQ, e.g. '3,5,7'. "
+            "If omitted, --num-layers is treated as total token budget, clamped to [3, 15], "
+            "and defaults to 3 scales."
+        ),
+    )
     args = parser.parse_args()
     if args.final_traj_only and args.late_soft_global_focus:
         parser.error("--final-traj-only and --late-soft-global-focus are mutually exclusive.")
@@ -982,6 +1059,7 @@ if __name__ == "__main__":
         f"future_loss_min_weight={args.future_loss_min_weight} | "
         f"final_traj_only={args.final_traj_only} | "
         f"late_soft_global_focus={args.late_soft_global_focus} | "
+        f"rvq_type={args.rvq_type} | rvq_scales={args.rvq_scales} | "
         f"late_endpoint_xy_weight={args.late_endpoint_xy_weight} | "
         f"late_tail_xy_weight={args.late_tail_xy_weight} | "
         f"late_tail_start_ratio={args.late_tail_start_ratio} | save_dir={args.save_dir}"
@@ -1011,4 +1089,6 @@ if __name__ == "__main__":
         late_endpoint_xy_weight=args.late_endpoint_xy_weight,
         late_tail_xy_weight=args.late_tail_xy_weight,
         late_tail_start_ratio=args.late_tail_start_ratio,
+        rvq_type=args.rvq_type,
+        rvq_scales=args.rvq_scales,
     )
